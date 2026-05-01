@@ -133,6 +133,13 @@ struct Args {
     /// When directories are provided, recurses into them and shows all changed files in a single multi-diff view.
     #[arg(long, action = clap::ArgAction::Append, num_args = 2, value_names = ["OLD_PATH", "NEW_PATH"])]
     diff: Vec<String>,
+    /// Open a dedicated review window for the working tree at the given
+    /// repository path (HEAD vs uncommitted). Blocks until the user
+    /// clicks "Send Review" or closes the window. On Send Review,
+    /// writes a JSON payload to stdout and exits 0. On cancel, writes
+    /// a short message to stderr and exits non-zero.
+    #[arg(long, value_name = "REPO")]
+    review: Option<String>,
     /// Uninstall Zed from user system
     #[cfg(all(
         any(target_os = "linux", target_os = "macos"),
@@ -668,20 +675,28 @@ fn main() -> Result<()> {
                 #[cfg(not(target_os = "windows"))]
                 let wsl = None;
 
-                let open_request = CliRequest::Open {
-                    paths,
-                    urls,
-                    diff_paths,
-                    diff_all: diff_all_mode,
-                    wsl,
-                    wait: args.wait,
-                    open_behavior,
-                    env,
-                    user_data_dir: user_data_dir_for_thread,
-                    dev_container: args.dev_container,
+                let request = if let Some(repo) = args.review.clone() {
+                    CliRequest::Review {
+                        repo,
+                        env,
+                        user_data_dir: user_data_dir_for_thread,
+                    }
+                } else {
+                    CliRequest::Open {
+                        paths,
+                        urls,
+                        diff_paths,
+                        diff_all: diff_all_mode,
+                        wsl,
+                        wait: args.wait,
+                        open_behavior,
+                        env,
+                        user_data_dir: user_data_dir_for_thread,
+                        dev_container: args.dev_container,
+                    }
                 };
 
-                tx.send(open_request)?;
+                tx.send(request)?;
 
                 while let Ok(response) = rx.recv() {
                     match response {

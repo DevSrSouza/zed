@@ -5,6 +5,7 @@ pub(crate) mod mac_only_instance;
 mod migrate;
 mod open_listener;
 mod open_url_modal;
+pub mod review_mode;
 mod quick_action_bar;
 pub mod remote_debug;
 pub mod telemetry_log;

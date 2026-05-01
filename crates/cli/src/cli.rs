@@ -69,6 +69,16 @@ pub enum CliRequest {
     SetOpenBehavior {
         behavior: CliBehaviorSetting,
     },
+    /// Open a dedicated review window over the working tree at `repo`
+    /// (HEAD vs uncommitted changes). The CLI blocks until the user
+    /// clicks "Send Review" or closes the window. On Send Review, the
+    /// window emits a JSON payload via Stdout and exits 0. On cancel,
+    /// it emits a Stderr message and exits non-zero.
+    Review {
+        repo: String,
+        env: Option<HashMap<String, String>>,
+        user_data_dir: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

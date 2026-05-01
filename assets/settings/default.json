@@ -1463,20 +1463,23 @@
   //
   // Default: true
   "word_diff_enabled": true,
-  // Control what info is collected by Zed.
+  // Control what info is collected by Zed. Defaults set to false in
+  // the claude-review-v2 fork: this build is a personal review tool,
+  // not the upstream distribution, so we don't ship telemetry.
   "telemetry": {
     // Send debug info like crash reports.
-    "diagnostics": true,
+    "diagnostics": false,
     // Send anonymized usage data like what languages you're using Zed with.
-    "metrics": true,
+    "metrics": false,
   },
   // Whether to disable all AI features in Zed.
   //
   // Default: false
   "disable_ai": false,
   // Automatically update Zed. This setting may be ignored on Linux if
-  // installed through a package manager.
-  "auto_update": true,
+  // installed through a package manager. Disabled in claude-review-v2
+  // — auto-update would replace the fork with upstream Zed.
+  "auto_update": false,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //
   // Possible values:
@@ -2202,6 +2205,7 @@
     },
     "Kotlin": {
       "language_servers": ["!kotlin-language-server", "kotlin-lsp", "..."],
+      "soft_wrap": "none",
     },
     "LaTeX": {
       "formatter": "language_server",

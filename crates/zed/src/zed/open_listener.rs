@@ -13,7 +13,9 @@ use futures::channel::{mpsc, oneshot};
 use futures::future;
 
 use futures::{FutureExt, StreamExt};
-use git_ui::{file_diff_view::FileDiffView, multi_diff_view::MultiDiffView};
+use git_ui::{
+    file_diff_view::FileDiffView, multi_diff_view::MultiDiffView, project_diff::ProjectDiff,
+};
 use gpui::{App, AsyncApp, Global, WindowHandle};
 use onboarding::FIRST_OPEN;
 use onboarding::show_onboarding_view;
@@ -540,8 +542,106 @@ pub async fn handle_cli_connection(
                 // resolve_open_behavior
                 debug_panic!("unexpected SetOpenBehavior message");
             }
+            CliRequest::Review {
+                repo,
+                env,
+                user_data_dir: _,
+            } => {
+                handle_review_request(repo, env, app_state, responses, cx).await;
+            }
         }
     }
+}
+
+/// Open a dedicated review window for `repo` (HEAD vs working tree).
+///
+/// 1. Validate the path is a git repo.
+/// 2. Stash the IPC response sink in the [`crate::review_mode`] global so
+///    that the `SendReviewToAgent` action handler (also wired up by
+///    `review_mode`) can take it on send/cancel.
+/// 3. Open a new workspace at `repo` and deploy the Project Diff
+///    multibuffer.
+/// 4. Return without sending an `Exit`. The exit is sent later by
+///    `review_mode::send_payload_and_exit` (on Send Review) or
+///    `review_mode::handle_cancel` (on window close).
+async fn handle_review_request(
+    repo: String,
+    env: Option<collections::HashMap<String, String>>,
+    app_state: Arc<AppState>,
+    responses: Box<dyn CliResponseSink>,
+    cx: &mut AsyncApp,
+) {
+    let repo_path = PathBuf::from(&repo);
+    if !repo_path.exists() {
+        responses
+            .send(CliResponse::Stderr {
+                message: format!("review: path does not exist: {repo}"),
+            })
+            .log_err();
+        responses.send(CliResponse::Exit { status: 2 }).log_err();
+        return;
+    }
+
+    cx.update(|cx| {
+        super::review_mode::enter(repo_path.clone(), responses, cx);
+        cx.activate(true);
+    });
+
+    let abs_path = match std::path::Path::new(&repo).canonicalize() {
+        Ok(p) => p,
+        Err(err) => {
+            cx.update(|cx| {
+                super::review_mode::send_payload_failure(
+                    &format!("review: cannot canonicalize repo path: {err}"),
+                    cx,
+                );
+            });
+            return;
+        }
+    };
+    let open_options = workspace::OpenOptions {
+        workspace_matching: workspace::WorkspaceMatching::None,
+        add_dirs_to_sidebar: false,
+        wait: false,
+        env,
+        ..Default::default()
+    };
+    let open_task = cx.update(|cx| {
+        workspace::open_paths(&[abs_path.clone()], app_state, open_options, cx)
+    });
+    let open_result = match open_task.await {
+        Ok(r) => r,
+        Err(err) => {
+            cx.update(|cx| {
+                super::review_mode::send_payload_failure(
+                    &format!("review: failed to open workspace at {repo}: {err:#}"),
+                    cx,
+                );
+            });
+            return;
+        }
+    };
+    let multi_workspace_window = open_result.window;
+    let workspace_entity = open_result.workspace;
+
+    cx.update(|cx| {
+        let window_handle: gpui::AnyWindowHandle = multi_workspace_window.into();
+        let weak = workspace_entity.downgrade();
+        super::review_mode::attach_workspace(weak, window_handle, cx);
+        multi_workspace_window
+            .update(cx, |_multi_workspace, window, cx| {
+                window.on_window_should_close(cx, |_window, cx| {
+                    super::review_mode::handle_cancel(cx);
+                    true
+                });
+                workspace_entity.update(cx, |workspace, cx| {
+                    ProjectDiff::deploy_at(workspace, None, window, cx);
+                    super::review_mode::focus_git_panel(workspace, window, cx);
+                });
+            })
+            .log_err();
+        cx.activate(true);
+    });
 }
 
 /// Resolves the CLI open behavior when no explicit flag (`-n`, `-e`, `--reuse`)

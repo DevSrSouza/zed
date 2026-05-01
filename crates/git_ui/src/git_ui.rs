@@ -42,6 +42,7 @@ pub mod git_picker;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
+pub mod review_mode_marker;
 pub(crate) mod remote_output;
 pub mod repository_selector;
 pub mod stash_picker;

@@ -22901,6 +22901,33 @@ impl Editor {
         cx.notify();
     }
 
+    /// Walks every open diff-review composer overlay, takes any
+    /// non-empty draft body, and saves it as a comment on the
+    /// corresponding hunk. Used by the claude-review fork's
+    /// "Send Review" path so the user does not lose drafts they
+    /// forgot to click Save on (SPECIFICATION.md §4.6).
+    pub fn submit_all_diff_review_comments(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let drafts: Vec<(DiffHunkKey, String, Range<Anchor>)> = self
+            .diff_review_overlays
+            .iter()
+            .filter_map(|overlay| {
+                let body = overlay.prompt_editor.read(cx).text(cx).trim().to_string();
+                if body.is_empty() {
+                    None
+                } else {
+                    Some((overlay.hunk_key.clone(), body, overlay.anchor_range.clone()))
+                }
+            })
+            .collect();
+        for (hunk_key, body, range) in drafts {
+            self.add_review_comment(hunk_key, body, range, cx);
+        }
+    }
+
     /// Returns the prompt editor for the diff review overlay, if one is active.
     /// This is primarily used for testing.
     pub fn diff_review_prompt_editor(&self) -> Option<&Entity<Editor>> {
@@ -22964,6 +22991,12 @@ impl Editor {
             .iter()
             .map(|(_, v)| v.len())
             .sum()
+    }
+
+    /// Returns all stored review comments grouped by hunk. Used by the
+    /// review-mode payload serializer (claude-review fork).
+    pub fn all_review_comments(&self) -> &[(DiffHunkKey, Vec<StoredReviewComment>)] {
+        &self.stored_review_comments
     }
 
     /// Returns the count of comments for a specific hunk.

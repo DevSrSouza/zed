@@ -9,6 +9,7 @@ use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
+    ToPoint as _,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
     multibuffer_context_lines,
     scroll::Autoscroll,
@@ -37,7 +38,7 @@ use settings::{Settings, SettingsStore};
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 use theme::ActiveTheme;
-use ui::{DiffStat, Divider, KeyBinding, Tooltip, prelude::*, vertical_divider};
+use ui::{DiffStat, Divider, KeyBinding, TintColor, Tooltip, prelude::*, vertical_divider};
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
     CloseActiveItem, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
@@ -61,6 +62,10 @@ actions!(
         BranchDiff,
         /// Opens a new agent thread with the branch diff for review.
         ReviewDiff,
+        /// Opens the full-file side-by-side diff (HEAD vs working tree)
+        /// for the file at the active cursor in the Project Diff. Used
+        /// by the claude-review fork to satisfy SPECIFICATION.md §5.6.
+        OpenFullFile,
         LeaderAndFollower,
     ]
 );
@@ -97,7 +102,108 @@ impl ProjectDiff {
         workspace.register_action(|workspace, _: &Add, window, cx| {
             Self::deploy(workspace, &Diff, window, cx);
         });
+        workspace.register_action(Self::open_full_file);
         workspace::register_serializable_item::<ProjectDiff>(cx);
+    }
+
+    /// Open the full-file side-by-side diff (HEAD vs working tree)
+    /// for the file containing the active cursor in the Project Diff.
+    /// Tabs are deduplicated by `(repo_root, file_path)` so opening
+    /// twice for the same file activates the existing tab
+    /// (SPECIFICATION.md §4.5).
+    fn open_full_file(
+        workspace: &mut Workspace,
+        _: &OpenFullFile,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(project_diff) = workspace
+            .items_of_type::<ProjectDiff>(cx)
+            .find(|pd| matches!(pd.read(cx).diff_base(cx), DiffBase::Head))
+        else {
+            return;
+        };
+
+        let pd = project_diff.read(cx);
+        let split = pd.editor.read(cx);
+        let editor = split.focused_editor();
+        let multibuffer = editor.read(cx).buffer().clone();
+        let snapshot = multibuffer.read(cx).snapshot(cx);
+
+        let anchor = editor.read(cx).selections.newest_anchor().head();
+        let cursor = anchor.to_point(&snapshot);
+        let Some(file) = snapshot.file_at(cursor).cloned() else {
+            return;
+        };
+        let project_path = project::ProjectPath {
+            worktree_id: file.worktree_id(cx),
+            path: file.path().clone(),
+        };
+
+        let project = workspace.project().clone();
+        let Some(working_abs_path) = project
+            .read(cx)
+            .absolute_path(&project_path, cx)
+        else {
+            return;
+        };
+
+        let Some(repo) = project.read(cx).active_repository(cx) else {
+            return;
+        };
+        let repo_path = repo.read(cx).work_directory_abs_path.clone();
+
+        let rel_path_in_repo = match working_abs_path.strip_prefix(&repo_path) {
+            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Err(_) => file.path().as_unix_str().to_string(),
+        };
+
+        // Tab dedupe: if a FileDiffView already exists for the same
+        // working file, just activate it instead of opening a new one.
+        let existing: Option<Entity<crate::file_diff_view::FileDiffView>> = workspace
+            .items_of_type::<crate::file_diff_view::FileDiffView>(cx)
+            .find(|view| {
+                view.read(cx)
+                    .new_buffer_path(cx)
+                    .as_ref()
+                    .map(|p| p == &working_abs_path)
+                    .unwrap_or(false)
+            });
+        if let Some(existing) = existing {
+            workspace.activate_item(&existing, true, true, window, cx);
+            return;
+        }
+
+        let workspace_weak = cx.entity().downgrade();
+        let working_path = working_abs_path.clone();
+        let head_blob_path = match dump_head_blob_to_temp(&repo_path, &rel_path_in_repo) {
+            Ok(path) => path,
+            Err(_err) => {
+                // No HEAD blob (e.g. untracked or new file) — diff
+                // against an empty file so the full content shows as
+                // additions.
+                match write_empty_temp_file() {
+                    Ok(p) => p,
+                    Err(_) => return,
+                }
+            }
+        };
+
+        window
+            .spawn(cx, async move |cx| {
+                cx.update(|window, cx| {
+                    crate::file_diff_view::FileDiffView::open(
+                        head_blob_path,
+                        working_path,
+                        workspace_weak,
+                        window,
+                        cx,
+                    )
+                })?
+                .await
+                .map(|_| ())
+            })
+            .detach();
     }
 
     fn deploy(
@@ -364,6 +470,10 @@ impl ProjectDiff {
             diff_display_editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_show_diff_review_button(true, cx);
 
+                if crate::review_mode_marker::is_active(cx) {
+                    editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
+                }
+
                 match branch_diff.read(cx).diff_base() {
                     DiffBase::Head => {
                         editor.register_addon(GitPanelAddon {
@@ -377,6 +487,13 @@ impl ProjectDiff {
                     }
                 }
             });
+            if crate::review_mode_marker::is_active(cx)
+                && let Some(lhs) = diff_display_editor.lhs_editor()
+            {
+                lhs.update(cx, |editor, cx| {
+                    editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
+                });
+            }
             diff_display_editor
         });
         let editor_subscription = cx.subscribe_in(&editor, window, Self::handle_editor_event);
@@ -893,6 +1010,35 @@ impl ProjectDiff {
             })
             .collect()
     }
+}
+
+/// Writes the contents of `HEAD:rel_path` to a fresh tempfile and
+/// returns its path. Used by `OpenFullFile` to feed
+/// [`FileDiffView::open`] (which requires both sides to be on disk).
+fn dump_head_blob_to_temp(
+    repo_root: &std::path::Path,
+    rel_path: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::anyhow;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["show", &format!("HEAD:{rel_path}")])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!("git show HEAD:{rel_path} failed"));
+    }
+    let mut tmp = tempfile::NamedTempFile::new()?;
+    use std::io::Write as _;
+    tmp.write_all(&output.stdout)?;
+    let (_file, path) = tmp.keep()?;
+    Ok(path)
+}
+
+fn write_empty_temp_file() -> anyhow::Result<std::path::PathBuf> {
+    let tmp = tempfile::NamedTempFile::new()?;
+    let (_file, path) = tmp.keep()?;
+    Ok(path)
 }
 
 fn sort_prefix(repo: &Repository, repo_path: &RepoPath, status: FileStatus, cx: &App) -> u64 {
@@ -1414,6 +1560,45 @@ impl Render for ProjectDiffToolbar {
         let button_states = project_diff.read(cx).button_states(cx);
         let review_count = project_diff.read(cx).total_review_comment_count();
 
+        // In review mode (`zed --review`) we hide the staging /
+        // commit affordances entirely so the toolbar layout does not
+        // shift when the user moves focus or collapses their
+        // selection. Without this, clicking "Send Review to Agent"
+        // first changed focus, the toolbar swapped between
+        // "Toggle Staged" and "Stage / Unstage" widgets, and the
+        // click event was lost on the now-stale element — forcing
+        // the user to click Send Review twice.
+        if crate::review_mode_marker::is_active(cx) {
+            return h_group_xl()
+                .my_neg_1()
+                .py_1()
+                .items_center()
+                .flex_wrap()
+                .justify_end()
+                .when(review_count > 0, |el| {
+                    // We wrap the button in a div with `on_mouse_down`
+                    // (not the button's own `on_click`) because in
+                    // review-mode the Send Review click consistently
+                    // landed only on the *second* attempt: the first
+                    // click was being eaten by macOS' click-to-focus
+                    // / focus-transition pass before reaching gpui's
+                    // synthesized click event. Mouse-down fires
+                    // before any focus negotiation, so the first
+                    // tap dispatches.
+                    el.child(
+                        div()
+                            .id("review-mode-send-wrap")
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|_this, _event, _window, cx| {
+                                    crate::review_mode_marker::dispatch_send_review(cx);
+                                }),
+                            )
+                            .child(render_send_review_to_agent_button(review_count, &focus_handle)),
+                    )
+                });
+        }
+
         h_group_xl()
             .my_neg_1()
             .py_1()
@@ -1558,8 +1743,8 @@ impl Render for ProjectDiffToolbar {
             .when(review_count > 0, |el| {
                 el.child(vertical_divider()).child(
                     render_send_review_to_agent_button(review_count, &focus_handle).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.dispatch_action(&SendReviewToAgent, window, cx)
+                        cx.listener(|_this, _, window, cx| {
+                            window.dispatch_action(SendReviewToAgent.boxed_clone(), cx);
                         }),
                     ),
                 )
@@ -1572,10 +1757,11 @@ fn render_send_review_to_agent_button(review_count: usize, focus_handle: &FocusH
         "send-review",
         format!("Send Review to Agent ({})", review_count),
     )
+    .style(ButtonStyle::Tinted(TintColor::Accent))
     .start_icon(
         Icon::new(IconName::ZedAssistant)
             .size(IconSize::Small)
-            .color(Color::Muted),
+            .color(Color::Accent),
     )
     .tooltip(Tooltip::for_action_title_in(
         "Send all review comments to the Agent panel",
@@ -1692,8 +1878,8 @@ impl Render for BranchDiffToolbar {
             .when(review_count > 0, |this| {
                 this.child(vertical_divider()).child(
                     render_send_review_to_agent_button(review_count, &focus_handle).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.dispatch_action(&SendReviewToAgent, window, cx)
+                        cx.listener(|_this, _, window, cx| {
+                            window.dispatch_action(SendReviewToAgent.boxed_clone(), cx);
                         }),
                     ),
                 )

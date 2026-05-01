@@ -34,6 +34,19 @@ pub struct FileDiffView {
     _recalculate_diff_task: Task<Result<()>>,
 }
 
+impl FileDiffView {
+    /// Absolute filesystem path of the new (working tree) buffer
+    /// backing this view, if any. Used by the claude-review fork
+    /// to deduplicate "Open full file" tabs by working file path.
+    pub fn new_buffer_path(&self, cx: &App) -> Option<PathBuf> {
+        self.new_buffer
+            .read(cx)
+            .file()
+            .and_then(|file| file.as_local())
+            .map(|local| local.abs_path(cx))
+    }
+}
+
 const RECALCULATE_DIFF_DEBOUNCE: Duration = Duration::from_millis(250);
 
 impl FileDiffView {
