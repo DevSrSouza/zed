@@ -10,6 +10,7 @@ pub mod debugger;
 pub mod git_store;
 pub mod image_store;
 pub mod lsp_command;
+pub mod lsp_json;
 pub mod lsp_store;
 pub mod manifest_tree;
 pub mod prettier_store;

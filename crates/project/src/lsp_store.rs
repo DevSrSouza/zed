@@ -359,7 +359,74 @@ impl LocalLspStore {
         disposition: &Arc<LaunchDisposition>,
         language_name: &LanguageName,
         cx: &mut App,
-    ) -> LanguageServerId {
+    ) -> (LanguageServerId, crate::ProjectPath) {
+        // claude-review-v2 fork: if `<root>/.lsp.json` declares an
+        // entry for this server, fold the Claude Code-style
+        // command / args / env / initializationOptions / settings
+        // into the launch disposition before we compute the seed
+        // key. The override gets baked into `LanguageServerSeed`
+        // so two different `.lsp.json` files in the same worktree
+        // produce two distinct seeds — and therefore two
+        // independent OS processes. If the entry sets
+        // `workspaceFolder`, we ALSO retarget the LSP root path
+        // to that directory; this lets a `.lsp.json` at one
+        // location anchor the language server somewhere else
+        // (handy when the build context — Package.swift,
+        // xcodeproj — sits in a different folder than the
+        // sources sourcekit-lsp will be asked about).
+        let disposition: Arc<LaunchDisposition> = {
+            use crate::lsp_json::{apply_to_lsp_settings, read_lsp_json};
+            let worktree_abs = worktree_handle.read(cx).abs_path().to_path_buf();
+            let abs_root = {
+                let mut path = worktree_abs.clone();
+                let rel = disposition.path.path.as_unix_str();
+                if !rel.is_empty() {
+                    path.push(rel);
+                }
+                path
+            };
+            if let Some(file) = read_lsp_json(&abs_root)
+                && let Some(server_cfg) = file.get(disposition.server_name.0.as_ref())
+            {
+                let mut settings: LspSettings = (*disposition.settings).clone();
+                apply_to_lsp_settings(server_cfg, &mut settings);
+                let new_path = if let Some(workspace_folder) = &server_cfg.workspace_folder {
+                    let folder = std::path::Path::new(workspace_folder);
+                    let absolute = if folder.is_absolute() {
+                        folder.to_path_buf()
+                    } else {
+                        abs_root.join(folder)
+                    };
+                    match absolute.strip_prefix(&worktree_abs) {
+                        Ok(rel) if !rel.as_os_str().is_empty() => {
+                            let s = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+                            match util::rel_path::RelPath::unix(s.as_str()) {
+                                Ok(rel_path) => crate::ProjectPath {
+                                    worktree_id: disposition.path.worktree_id,
+                                    path: rel_path.into(),
+                                },
+                                Err(_) => disposition.path.clone(),
+                            }
+                        }
+                        Ok(_) => crate::ProjectPath {
+                            worktree_id: disposition.path.worktree_id,
+                            path: util::rel_path::RelPath::empty().into(),
+                        },
+                        Err(_) => disposition.path.clone(),
+                    }
+                } else {
+                    disposition.path.clone()
+                };
+                Arc::new(LaunchDisposition {
+                    server_name: disposition.server_name.clone(),
+                    path: new_path,
+                    settings: Arc::new(settings),
+                    toolchain: disposition.toolchain.clone(),
+                })
+            } else {
+                disposition.clone()
+            }
+        };
         let key = LanguageServerSeed {
             worktree_id: worktree_handle.read(cx).id(),
             name: disposition.server_name.clone(),
@@ -371,7 +438,7 @@ impl LocalLspStore {
         };
         if let Some(state) = self.language_server_ids.get_mut(&key) {
             state.project_roots.insert(disposition.path.path.clone());
-            state.id
+            (state.id, disposition.path.clone())
         } else {
             let adapter = self
                 .languages
@@ -379,6 +446,21 @@ impl LocalLspStore {
                 .into_iter()
                 .find(|adapter| adapter.name() == disposition.server_name)
                 .expect("To find LSP adapter");
+            // Compute the absolute root that the LSP process will
+            // be launched against. Normally this is the worktree
+            // root; when a `.lsp.json` retargeted us, it's
+            // worktree_root + disposition.path. sourcekit-lsp
+            // (and most servers) rely on the OS cwd to discover
+            // build context like Package.swift / xcodeproj.
+            let lsp_root_abs: Arc<std::path::Path> = {
+                let worktree = worktree_handle.read(cx);
+                let mut p = worktree.abs_path().to_path_buf();
+                let rel = disposition.path.path.as_unix_str();
+                if !rel.is_empty() {
+                    p.push(rel);
+                }
+                Arc::from(p)
+            };
             let new_language_server_id = self.start_language_server(
                 worktree_handle,
                 delegate,
@@ -386,6 +468,7 @@ impl LocalLspStore {
                 disposition.settings.clone(),
                 key.clone(),
                 language_name.clone(),
+                Some(lsp_root_abs),
                 cx,
             );
             if let Some(state) = self.language_server_ids.get_mut(&key) {
@@ -396,7 +479,7 @@ impl LocalLspStore {
                     "Expected `start_language_server` to ensure that `key` exists in a map"
                 );
             }
-            new_language_server_id
+            (new_language_server_id, disposition.path.clone())
         }
     }
 
@@ -408,12 +491,20 @@ impl LocalLspStore {
         settings: Arc<LspSettings>,
         key: LanguageServerSeed,
         language_name: LanguageName,
+        // claude-review-v2 fork: when a `.lsp.json`-driven
+        // workspaceFolder retarget kicks in, the caller passes the
+        // absolute path that the LSP process should run against.
+        // None falls back to the worktree's own abs path
+        // (upstream behavior).
+        lsp_root_abs_override: Option<Arc<std::path::Path>>,
         cx: &mut App,
     ) -> LanguageServerId {
         let worktree = worktree_handle.read(cx);
 
         let worktree_id = worktree.id();
-        let worktree_abs_path = worktree.abs_path();
+        let worktree_abs_path = lsp_root_abs_override
+            .clone()
+            .unwrap_or_else(|| worktree.abs_path());
         let toolchain = key.toolchain.clone();
         let override_options = settings.initialization_options.clone();
 
@@ -2851,26 +2942,23 @@ impl LocalLspStore {
                 }
 
                 let server_id = server_node.server_id_or_init(|disposition| {
-                    let path = &disposition.path;
+                    let (server_id, effective_path) = self.get_or_insert_language_server(
+                        &worktree,
+                        delegate.clone(),
+                        disposition,
+                        &language_name,
+                        cx,
+                    );
 
+                    let uri = Uri::from_file_path(
+                        worktree.read(cx).absolutize(&effective_path.path),
+                    );
+                    if let Some(state) = self.language_servers.get(&server_id)
+                        && let Ok(uri) = uri
                     {
-                        let uri = Uri::from_file_path(worktree.read(cx).absolutize(&path.path));
-
-                        let server_id = self.get_or_insert_language_server(
-                            &worktree,
-                            delegate.clone(),
-                            disposition,
-                            &language_name,
-                            cx,
-                        );
-
-                        if let Some(state) = self.language_servers.get(&server_id)
-                            && let Ok(uri) = uri
-                        {
-                            state.add_workspace_folder(uri);
-                        };
-                        server_id
-                    }
+                        state.add_workspace_folder(uri);
+                    };
+                    server_id
                 })?;
                 let server_state = self.language_servers.get(&server_id)?;
                 if let LanguageServerState::Running {
@@ -5464,7 +5552,6 @@ impl LspStore {
                     for node in nodes {
                         let server_id = node.server_id_or_init(|disposition| {
                             let path = &disposition.path;
-                            let uri = Uri::from_file_path(worktree.read(cx).absolutize(&path.path));
                             let key = LanguageServerSeed {
                                 worktree_id,
                                 name: disposition.server_name.clone(),
@@ -5483,12 +5570,16 @@ impl LspStore {
                             };
                             local.language_server_ids.remove(&key);
 
-                            let server_id = local.get_or_insert_language_server(
-                                &worktree,
-                                lsp_delegate.clone(),
-                                disposition,
-                                &language.name(),
-                                cx,
+                            let (server_id, effective_path) = local
+                                .get_or_insert_language_server(
+                                    &worktree,
+                                    lsp_delegate.clone(),
+                                    disposition,
+                                    &language.name(),
+                                    cx,
+                                );
+                            let uri = Uri::from_file_path(
+                                worktree.read(cx).absolutize(&effective_path.path),
                             );
                             if let Some(state) = local.language_servers.get(&server_id)
                                 && let Ok(uri) = uri

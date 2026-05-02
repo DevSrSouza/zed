@@ -85,6 +85,33 @@ pub struct ProjectSettingsContent {
     ///
     /// Default: false
     pub disable_ai: Option<SaturatingBool>,
+
+    /// LSP root-detection overrides (claude-review-v2 fork).
+    /// When configured, files placed at any directory in the
+    /// worktree act as anchors that pin the LSP "project root" to
+    /// that directory regardless of language-specific manifest
+    /// detection. Useful in monorepos where built-in detection
+    /// (e.g. searching for `Cargo.toml` / `build.gradle.kts`)
+    /// finds the wrong root.
+    pub lsp_root: Option<LspRootSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct LspRootSettingsContent {
+    /// Files that, when found in an ancestor directory, pin the
+    /// LSP root to that directory. Searched bottom-up; first
+    /// matching ancestor wins. Defaults to `[".lsp.json"]`
+    /// (Claude Code-compatible LSP plugin manifest, see
+    /// <https://code.claude.com/docs/en/plugins-reference#lsp-servers>).
+    /// An empty list disables marker-based root detection.
+    pub marker_files: Option<Vec<String>>,
+    /// When true, the per-language built-in manifest providers
+    /// (Cargo.toml, pyproject.toml, etc.) are NOT consulted at
+    /// all. Only the marker_files above can pin a root; if no
+    /// marker is found the LSP falls back to the worktree root.
+    /// Default: false.
+    pub disable_builtin_manifest_providers: Option<bool>,
 }
 
 #[with_fallible_options]

@@ -79,6 +79,15 @@ pub struct ProjectSettings {
 
     /// Configuration for session-related features
     pub session: SessionSettings,
+
+    /// claude-review-v2 fork: list of marker filenames whose
+    /// presence in an ancestor directory pins the LSP root to
+    /// that directory. See `lsp_root` in settings.json.
+    pub lsp_root_marker_files: Vec<String>,
+    /// claude-review-v2 fork: when true, skips every per-
+    /// language built-in manifest provider so only marker
+    /// files can pin a root.
+    pub lsp_root_disable_builtin_manifest_providers: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -730,6 +739,16 @@ impl Settings for ProjectSettings {
                 restore_unsaved_buffers: content.session.unwrap().restore_unsaved_buffers.unwrap(),
                 trust_all_worktrees: content.session.unwrap().trust_all_worktrees.unwrap(),
             },
+            lsp_root_marker_files: project
+                .lsp_root
+                .as_ref()
+                .and_then(|r| r.marker_files.clone())
+                .unwrap_or_else(|| vec![".lsp.json".to_string()]),
+            lsp_root_disable_builtin_manifest_providers: project
+                .lsp_root
+                .as_ref()
+                .and_then(|r| r.disable_builtin_manifest_providers)
+                .unwrap_or(false),
         }
     }
 }

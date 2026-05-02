@@ -66,6 +66,33 @@ impl WorktreeRoots {
     }
 }
 
+/// claude-review-v2 fork: returns true iff the worktree contains
+/// any of the given marker filenames anywhere in its in-memory
+/// path index. Bails on the first hit. Used by `root_for_path` to
+/// switch the entire worktree into "marker-only" mode when the
+/// project has opted in by dropping a `.lsp.json` (or any other
+/// configured marker) somewhere in the tree.
+fn worktree_has_any_marker(
+    worktree_store: &Entity<WorktreeStore>,
+    worktree_id: WorktreeId,
+    markers: &[String],
+    cx: &App,
+) -> bool {
+    let Some(worktree) = worktree_store.read(cx).worktree_for_id(worktree_id, cx) else {
+        return false;
+    };
+    let worktree = worktree.read(cx);
+    for path in worktree.paths() {
+        let Some(name) = path.as_unix_str().rsplit('/').next() else {
+            continue;
+        };
+        if markers.iter().any(|m| m.as_str() == name) {
+            return true;
+        }
+    }
+    false
+}
+
 pub struct ManifestTree {
     root_points: HashMap<WorktreeId, Entity<WorktreeRoots>>,
     worktree_store: Entity<WorktreeStore>,
@@ -98,6 +125,49 @@ impl ManifestTree {
         cx: &mut App,
     ) -> Option<ProjectPath> {
         debug_assert_eq!(delegate.worktree_id(), *worktree_id);
+
+        // claude-review-v2 fork: marker-file root override.
+        //
+        // 1) If any configured marker filename (default
+        //    `.lsp.json`, Claude Code-compatible) is in an
+        //    ancestor of this path, that ancestor wins as the
+        //    LSP root.
+        // 2) If a marker exists *anywhere in the worktree* (the
+        //    project has explicitly opted in to marker-driven
+        //    root detection), every per-language built-in
+        //    manifest provider is short-circuited — only marker
+        //    ancestors can pin a root. Files outside any marker
+        //    fall back to the worktree root.
+        // 3) The explicit `disable_builtin_manifest_providers`
+        //    setting forces (2) on regardless of presence.
+        let (markers, disable_builtins) = {
+            use crate::project_settings::ProjectSettings;
+            use settings::Settings;
+            let s = ProjectSettings::get_global(cx);
+            (s.lsp_root_marker_files.clone(), s.lsp_root_disable_builtin_manifest_providers)
+        };
+        if !markers.is_empty() {
+            for ancestor in path.ancestors() {
+                for marker in &markers {
+                    let Ok(rel) = RelPath::unix(marker.as_str()) else {
+                        continue;
+                    };
+                    let candidate = ancestor.join(rel);
+                    if delegate.exists(&candidate, Some(false)) {
+                        return Some(ProjectPath {
+                            worktree_id: *worktree_id,
+                            path: Arc::from(ancestor),
+                        });
+                    }
+                }
+            }
+            if disable_builtins
+                || worktree_has_any_marker(&self.worktree_store, *worktree_id, &markers, cx)
+            {
+                return None;
+            }
+        }
+
         let (mut marked_path, mut current_presence) = (None, LabelPresence::KnownAbsent);
         let worktree_roots = match self.root_points.entry(*worktree_id) {
             Entry::Occupied(occupied_entry) => occupied_entry.get().clone(),

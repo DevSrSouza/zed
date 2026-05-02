@@ -2011,6 +2011,12 @@
     ],
     "Markdown": [".rules", ".cursorrules", ".windsurfrules", ".clinerules"],
     "Shell Script": [".env.*"],
+    // claude-review-v2 fork: route sourcekit-lsp's generated
+    // `.swiftinterface` files (e.g. SwiftUI/UIKit framework
+    // headers it surfaces during Go-to-Definition) through the
+    // Swift language so Zed actually attaches the LSP to the
+    // resulting buffer instead of opening it as plain text.
+    "Swift": ["swiftinterface"],
   },
   // Settings for which version of Node.js and NPM to use when installing
   // language servers and Copilot.
