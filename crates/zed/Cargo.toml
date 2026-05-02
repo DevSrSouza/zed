@@ -86,6 +86,7 @@ codestral.workspace = true
 collab_ui.workspace = true
 collections.workspace = true
 command_palette.workspace = true
+search_everywhere.workspace = true
 component.workspace = true
 component_preview.workspace = true
 copilot.workspace = true

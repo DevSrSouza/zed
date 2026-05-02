@@ -1271,13 +1271,27 @@ impl ProjectSearchView {
                     cx,
                 );
             }
-            let query = action
+            let action_query_provided = action
+                .query
+                .as_deref()
+                .map(|q| !q.is_empty())
+                .unwrap_or(false);
+            let suggestion_used = !action_query_provided && query.as_deref().map_or(false, |q| !q.is_empty());
+            let resolved_query = action
                 .query
                 .as_deref()
                 .filter(|q| !q.is_empty())
                 .or(query.as_deref());
-            if let Some(query) = query {
-                search.set_query(query, window, cx);
+            if let Some(resolved_query) = resolved_query {
+                search.set_query(resolved_query, window, cx);
+            }
+            // claude-review-v2 fork: if the query was filled from the
+            // active editor's selection / word-under-cursor (i.e. the
+            // user selected something then hit cmd+shift+F), kick off
+            // the search immediately instead of forcing them to press
+            // Enter on a query they already had in hand.
+            if suggestion_used {
+                search.search(cx);
             }
             if let Some(included_files) = action.included_files.as_deref() {
                 search

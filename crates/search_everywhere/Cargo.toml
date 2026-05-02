@@ -1,0 +1,24 @@
+[package]
+name = "search_everywhere"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+name = "search_everywhere"
+path = "src/search_everywhere.rs"
+
+[dependencies]
+anyhow.workspace = true
+fuzzy_nucleo.workspace = true
+futures.workspace = true
+gpui.workspace = true
+picker.workspace = true
+project.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true

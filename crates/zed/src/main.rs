@@ -636,6 +636,7 @@ fn main() {
             cx.background_executor().clone(),
         );
         command_palette::init(cx);
+        search_everywhere::init(cx);
         let copilot_chat_configuration = copilot_chat::CopilotChatConfiguration {
             enterprise_uri: language::language_settings::all_language_settings(None, cx)
                 .edit_predictions

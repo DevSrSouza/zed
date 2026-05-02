@@ -70,6 +70,14 @@ impl HighlightedLabel {
         self.base.base.style()
     }
 
+    /// Truncate overflowing text from the start (`…/file.kt`) so the
+    /// trailing portion (filename + extension) stays visible. Used by
+    /// the search-everywhere picker to render long project paths.
+    pub fn truncate_start(mut self) -> Self {
+        self.base = self.base.truncate_start();
+        self
+    }
+
     pub fn flex_1(mut self) -> Self {
         self.style().flex_grow = Some(1.);
         self.style().flex_shrink = Some(1.);
