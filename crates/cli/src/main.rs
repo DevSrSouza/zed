@@ -140,6 +140,11 @@ struct Args {
     /// a short message to stderr and exits non-zero.
     #[arg(long, value_name = "REPO")]
     review: Option<String>,
+    /// Install the bundled `start-review` skill into the user's
+    /// Claude Code skills directory (`~/.claude/skills/start-review/SKILL.md`),
+    /// then exit. Overwrites any existing file at that path.
+    #[arg(long)]
+    install_review_skill: bool,
     /// Uninstall Zed from user system
     #[cfg(all(
         any(target_os = "linux", target_os = "macos"),
@@ -466,6 +471,28 @@ fn parse_path_in_wsl(source: &str, wsl: &str) -> Result<String> {
     Ok(source.to_string(&|path| path.to_string_lossy().into_owned()))
 }
 
+/// Bundled copy of `start-review` SKILL.md, baked in at compile time.
+const START_REVIEW_SKILL: &str = include_str!("../start-review-skill.md");
+
+/// `zed --install-review-skill` — write the bundled SKILL.md to
+/// `~/.claude/skills/start-review/SKILL.md`. Overwrites any existing
+/// file at that path. Exits 0 on success.
+fn install_review_skill() -> Result<()> {
+    let home = std::env::var_os("HOME").context("$HOME not set")?;
+    let dest_dir = PathBuf::from(home)
+        .join(".claude")
+        .join("skills")
+        .join("start-review");
+    fs::create_dir_all(&dest_dir).context("creating skills directory")?;
+    let dest_file = dest_dir.join("SKILL.md");
+    // Remove first so a pre-existing symlink doesn't get followed
+    // and we end up writing into whatever the symlink targets.
+    let _ = fs::remove_file(&dest_file);
+    fs::write(&dest_file, START_REVIEW_SKILL).context("writing SKILL.md")?;
+    println!("installed start-review skill: {}", dest_file.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     #[cfg(unix)]
     util::prevent_root_execution();
@@ -493,6 +520,10 @@ fn main() -> Result<()> {
     if let Some(socket) = &args.askpass {
         askpass::main(socket);
         return Ok(());
+    }
+
+    if args.install_review_skill {
+        return install_review_skill();
     }
 
     // Set custom data directory before any path operations
