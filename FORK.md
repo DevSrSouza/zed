@@ -80,3 +80,48 @@ Performance:
 # Project Panel — Tree-ASCII Indent Guides
 
 Adds a per-row horizontal elbow that meets the existing vertical indent guide so the project tree reads more like a `tree`-style outline instead of disconnected dashes. No configuration — automatic at depth > 0.
+
+# Project Panel — Fold-Chain Exceptions
+
+Zed already merges single-child folder chains into one row when `auto_fold_dirs` is enabled (e.g. `src/commonMain/kotlin/co/foo/bar`). This feature adds **rules that break that chain** so logical boundaries (source-set roots, language roots, gradle modules) always render on their own line.
+
+Configure via `project_panel.fold_exceptions` in `settings.json` (global or per-project `.zed/settings.json`). Defaults cover the Kotlin / Gradle layout: `kotlin/` inside `src/*Main/`, `src/*Test/`, `src/main/`, `src/test/`; the `*Main` / `*Test` / `main` / `test` source-set folders themselves; and `src/` whose parent has a `build.gradle.kts`.
+
+```json
+{
+  "project_panel": {
+    "fold_exceptions": [
+      {
+        "name": "my-rule",
+        "name_pattern": "kotlin",
+        "path_glob": "**/src/*Main/kotlin",
+        "parent_has_files": ["build.gradle.kts"],
+        "is_ignored": false
+      }
+    ]
+  }
+}
+```
+
+Match dimensions are AND'd. A folder matched by ANY rule breaks the chain. Available dimensions:
+
+- `name_pattern` — glob against the folder name.
+- `path_glob` — glob against the worktree-relative path.
+- `parent_has_files` — fires only when the parent dir contains any of the listed filenames.
+- `is_ignored` — restrict to gitignored / non-ignored folders.
+
+Replace defaults / opt out:
+
+- Omit `fold_exceptions` → defaults from `crates/project_panel/default_fold_exceptions.json` apply.
+- `fold_exceptions: []` → all rules disabled, full upstream collapse behavior.
+- `fold_exceptions: [...]` → fully replaces defaults.
+
+Result: a tree like `src/commonMain/kotlin/co/foo/bar` renders as
+
+```
+src / commonMain / kotlin /
+   co / foo / bar /
+      …files…
+```
+
+instead of one giant collapsed row.

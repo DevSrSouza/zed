@@ -813,6 +813,34 @@ pub struct ProjectPanelSettingsContent {
     /// Gradle module roots (folders containing `build.gradle.kts`).
     /// To opt out of defaults set this to `[]` (an empty list).
     pub folder_colors: Option<Vec<FolderColorRuleContent>>,
+    /// Folders that must NOT be merged into a single-line chain
+    /// when `auto_fold_dirs` is enabled. Each rule matches a
+    /// folder; matched folders break the auto-fold chain so they
+    /// always render on their own line. Useful for keeping
+    /// IntelliJ-like "module / source-set / language root"
+    /// boundaries visible (e.g. `kotlin/` inside `src/*Main/`
+    /// stays as its own row instead of getting collapsed into
+    /// `src/commonMain/kotlin/co/foo/...`).
+    ///
+    /// Default: a built-in starter set covering Kotlin / Gradle
+    /// source-set boundaries. To opt out set to `[]`.
+    pub fold_exceptions: Option<Vec<FoldExceptionRuleContent>>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct FoldExceptionRuleContent {
+    /// Optional human-readable label for the rule.
+    pub name: Option<String>,
+    /// Glob against the folder name (last path segment).
+    pub name_pattern: Option<String>,
+    /// Glob against the worktree-relative path.
+    pub path_glob: Option<String>,
+    /// Rule fires only when the folder's parent directory contains
+    /// at least one of these filenames.
+    pub parent_has_files: Option<Vec<String>>,
+    /// `Some(true)` to apply only to gitignored folders, etc.
+    pub is_ignored: Option<bool>,
 }
 
 #[with_fallible_options]

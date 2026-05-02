@@ -1,3 +1,4 @@
+pub mod fold_exceptions;
 pub mod folder_colors;
 pub mod project_panel_settings;
 mod undo;
@@ -3978,6 +3979,13 @@ impl ProjectPanel {
             .collect();
         let hide_root = settings.hide_root && visible_worktrees.len() == 1;
         let hide_hidden = settings.hide_hidden;
+        // Fetch fold-exception rules on the foreground thread so we
+        // can move them into the background-spawn closure that does
+        // the actual auto-fold walk.
+        let fold_exception_rules =
+            crate::fold_exceptions::FoldExceptionsSettings::get_global(cx)
+                .rules
+                .clone();
 
         let visible_entries_task = cx.spawn_in(window, async move |this, cx| {
             let new_state = cx
@@ -4019,7 +4027,67 @@ impl ProjectPanel {
                             }
                             if auto_collapse_dirs && entry.kind.is_dir() {
                                 auto_folded_ancestors.push(entry.id);
-                                if !new_state.is_unfolded(&entry.id)
+                                // Rule-based fold exceptions
+                                // (claude-review-v2 fork): if this
+                                // folder matches one of the
+                                // configured `fold_exceptions`
+                                // rules, fall through to the render
+                                // block so it stays on its own
+                                // line. The chain of folded
+                                // ancestors collected so far is
+                                // still attached to this row.
+                                let blocks_fold = {
+                                    use crate::fold_exceptions::matches;
+                                    let rules = fold_exception_rules.clone();
+                                    if rules.is_empty() {
+                                        false
+                                    } else {
+                                        let folder_name = entry
+                                            .path
+                                            .as_unix_str()
+                                            .rsplit('/')
+                                            .next()
+                                            .unwrap_or("");
+                                        let relative_path = entry.path.as_unix_str();
+                                        let needs_parent = rules
+                                            .iter()
+                                            .any(|r| !r.parent_has_files.is_empty());
+                                        let parent_filenames_owned: Vec<String> = if needs_parent {
+                                            entry
+                                                .path
+                                                .parent()
+                                                .map(|parent| {
+                                                    worktree_snapshot
+                                                        .child_entries(parent)
+                                                        .map(|e| {
+                                                            e.path
+                                                                .as_unix_str()
+                                                                .rsplit('/')
+                                                                .next()
+                                                                .unwrap_or("")
+                                                                .to_string()
+                                                        })
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        let parent_refs: Vec<&str> = parent_filenames_owned
+                                            .iter()
+                                            .map(String::as_str)
+                                            .collect();
+                                        matches(
+                                            &rules,
+                                            folder_name,
+                                            relative_path,
+                                            &parent_refs,
+                                            entry.is_ignored,
+                                        )
+                                    }
+                                };
+                                if !blocks_fold
+                                    && !new_state.is_unfolded(&entry.id)
                                     && let Some(root_path) = worktree_snapshot.root_entry()
                                 {
                                     let mut child_entries =

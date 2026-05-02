@@ -838,6 +838,7 @@ impl VsCodeSettings {
             diagnostic_badges: None,
             git_status_indicator: None,
             folder_colors: None,
+            fold_exceptions: None,
         };
 
         if let (Some(false), Some(false)) = (

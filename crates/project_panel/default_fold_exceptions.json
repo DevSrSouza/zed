@@ -1,0 +1,47 @@
+[
+  {
+    "name": "kotlin-main-language-root",
+    "name_pattern": "kotlin",
+    "path_glob": "**/src/*Main/kotlin"
+  },
+  {
+    "name": "kotlin-test-language-root",
+    "name_pattern": "kotlin",
+    "path_glob": "**/src/*Test/kotlin"
+  },
+  {
+    "name": "java-gradle-main-language-root",
+    "name_pattern": "kotlin",
+    "path_glob": "**/src/main/kotlin"
+  },
+  {
+    "name": "java-gradle-test-language-root",
+    "name_pattern": "kotlin",
+    "path_glob": "**/src/test/kotlin"
+  },
+  {
+    "name": "kotlin-main-source-set",
+    "name_pattern": "*Main",
+    "path_glob": "**/src/*Main"
+  },
+  {
+    "name": "kotlin-test-source-set",
+    "name_pattern": "*Test",
+    "path_glob": "**/src/*Test"
+  },
+  {
+    "name": "java-gradle-main-source-set",
+    "name_pattern": "main",
+    "path_glob": "**/src/main"
+  },
+  {
+    "name": "java-gradle-test-source-set",
+    "name_pattern": "test",
+    "path_glob": "**/src/test"
+  },
+  {
+    "name": "src-of-gradle-module",
+    "name_pattern": "src",
+    "parent_has_files": ["build.gradle.kts", "build.gradle"]
+  }
+]
