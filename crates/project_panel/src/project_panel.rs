@@ -1,3 +1,4 @@
+pub mod folder_colors;
 pub mod project_panel_settings;
 mod undo;
 mod utils;
@@ -163,6 +164,13 @@ pub struct ProjectPanel {
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
     state: State,
+    /// Memoized folder-color resolution per (worktree, folder path).
+    /// Filled lazily on render, cleared whenever the project emits
+    /// a worktree-update event so changes to marker files (e.g. a
+    /// new `build.gradle.kts`) take effect on the next paint.
+    folder_color_cache: std::cell::RefCell<
+        collections::HashMap<(WorktreeId, Arc<RelPath>), Option<gpui::Hsla>>,
+    >,
 }
 
 struct UpdateVisibleEntriesTask {
@@ -667,6 +675,11 @@ impl ProjectPanel {
                     project::Event::WorktreeUpdatedEntries(_, _)
                     | project::Event::WorktreeAdded(_)
                     | project::Event::WorktreeOrderChanged => {
+                        // Drop the folder-color memo so the next
+                        // render recomputes — file changes in the
+                        // worktree may have added/removed a marker
+                        // file (e.g. `build.gradle.kts`).
+                        this.folder_color_cache.borrow_mut().clear();
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }
@@ -834,6 +847,7 @@ impl ProjectPanel {
                 },
                 update_visible_entries_task: Default::default(),
                 undo_manager: UndoManager::new(workspace.weak_handle(), weak_project_panel, &cx),
+                folder_color_cache: Default::default(),
             };
             this.update_visible_entries(None, false, false, window, cx);
 
@@ -5298,6 +5312,182 @@ impl ProjectPanel {
         let diagnostic_count = details.diagnostic_count;
         let item_colors = get_item_color(is_sticky, cx);
 
+        // Rule-based folder background color (claude-review-v2 fork).
+        // The expensive bits (sibling/descendant scans) are cached
+        // on the panel keyed by `(WorktreeId, RelPath)`; the cache
+        // is cleared in the `WorktreeUpdatedEntries`/`WorktreeAdded`/
+        // `WorktreeOrderChanged` event handler so changes to marker
+        // files (e.g. a new `build.gradle.kts`) take effect on the
+        // next paint.
+        let cache_key = (details.worktree_id, details.path.clone());
+        let cached_bg: Option<Option<gpui::Hsla>> = self
+            .folder_color_cache
+            .borrow()
+            .get(&cache_key)
+            .copied();
+        let folder_bg_color: Option<gpui::Hsla> = if let Some(cached) = cached_bg {
+            cached
+        } else {
+            let computed: Option<gpui::Hsla> = {
+            use crate::folder_colors::{match_color, tinted_background, EntryCtx, FolderColorsSettings};
+            let rules = FolderColorsSettings::get_global(cx).rules.clone();
+            if rules.is_empty() {
+                None
+            } else {
+                // Cheap "does any rule actually need this dimension?"
+                // probes — when the active ruleset doesn't reference
+                // a particular check, skip the scan entirely. Keeps
+                // file rows (which never need contains/descendant
+                // scans) close to free.
+                let needs_parent_scan =
+                    rules.iter().any(|r| !r.parent_has_files.is_empty());
+                let needs_children_scan = kind.is_dir()
+                    && rules.iter().any(|r| !r.contains_files.is_empty());
+                let project = self.project.read(cx);
+                let worktree = project.worktree_for_id(details.worktree_id, cx);
+                let folder_name = details.filename.clone();
+                let rel_path_string = details.path.as_unix_str().to_string();
+                let (parent_filenames_owned, child_filenames_owned): (
+                    Vec<String>,
+                    Vec<String>,
+                ) = if let Some(worktree) = worktree {
+                    let snapshot = worktree.read(cx).snapshot();
+                    let parent_files: Vec<String> = if needs_parent_scan {
+                        details
+                            .path
+                            .parent()
+                            .map(|parent| {
+                                snapshot
+                                    .child_entries(parent)
+                                    .map(|e| {
+                                        e.path
+                                            .as_unix_str()
+                                            .rsplit('/')
+                                            .next()
+                                            .unwrap_or("")
+                                            .to_string()
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let direct_children: Vec<String> = if needs_children_scan {
+                        snapshot
+                            .child_entries(&details.path)
+                            .map(|e| {
+                                e.path
+                                    .as_unix_str()
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_string()
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    (parent_files, direct_children)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                let parent_filenames: Vec<&str> =
+                    parent_filenames_owned.iter().map(String::as_str).collect();
+                let child_filenames: Vec<&str> =
+                    child_filenames_owned.iter().map(String::as_str).collect();
+                // `descendant_has_files` lookups walk the worktree
+                // subtree rooted at this folder. Skip entirely if no
+                // active rule actually needs it (cheap check on the
+                // already-loaded rules) — otherwise every folder
+                // render walks its subtree each frame.
+                let needs_descendant_walk = kind.is_dir()
+                    && rules
+                        .iter()
+                        .any(|r| !r.descendant_has_files.is_empty());
+                let snapshot_for_descendants = if needs_descendant_walk {
+                    project
+                        .worktree_for_id(details.worktree_id, cx)
+                        .map(|w| w.read(cx).snapshot())
+                } else {
+                    None
+                };
+                let folder_path_for_descendants = details.path.clone();
+                let has_descendant = move |name: &str| -> bool {
+                    let Some(snapshot) = snapshot_for_descendants.as_ref() else {
+                        return false;
+                    };
+                    let target = name.to_string();
+                    snapshot
+                        .traverse_from_path(true, false, false, &folder_path_for_descendants)
+                        .take_while(|entry| {
+                            entry.path.starts_with(&folder_path_for_descendants)
+                        })
+                        .any(|entry| {
+                            entry
+                                .path
+                                .as_unix_str()
+                                .rsplit('/')
+                                .next()
+                                .map(|leaf| leaf == target)
+                                .unwrap_or(false)
+                        })
+                };
+                let any_propagate = rules.iter().any(|r| r.propagate_to_children);
+                let mut ancestor_ctxs_owned: Vec<(String, String, bool)> = Vec::new();
+                if any_propagate {
+                    let mut walker = details.path.parent();
+                    while let Some(p) = walker {
+                        if p.as_unix_str().is_empty() {
+                            break;
+                        }
+                        let name = p
+                            .as_unix_str()
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        let path_string = p.as_unix_str().to_string();
+                        let entry_ignored = project
+                            .worktree_for_id(details.worktree_id, cx)
+                            .and_then(|w| {
+                                w.read(cx)
+                                    .snapshot()
+                                    .entry_for_path(&p)
+                                    .map(|e| e.is_ignored)
+                            })
+                            .unwrap_or(false);
+                        ancestor_ctxs_owned.push((name, path_string, entry_ignored));
+                        walker = p.parent();
+                    }
+                }
+                let ancestor_ctxs: Vec<EntryCtx> = ancestor_ctxs_owned
+                    .iter()
+                    .map(|(name, path, ignored)| EntryCtx {
+                        name,
+                        relative_path: path,
+                        parent_filenames: &[],
+                        direct_child_filenames: &[],
+                        is_ignored: *ignored,
+                    })
+                    .collect();
+                let self_ctx = EntryCtx {
+                    name: &folder_name,
+                    relative_path: &rel_path_string,
+                    parent_filenames: &parent_filenames,
+                    direct_child_filenames: &child_filenames,
+                    is_ignored: details.is_ignored,
+                };
+                match_color(&rules, &self_ctx, &ancestor_ctxs, has_descendant)
+                    .map(|spec| tinted_background(&spec, cx))
+            }
+            };
+            self.folder_color_cache
+                .borrow_mut()
+                .insert(cache_key, computed);
+            computed
+        };
+
         let canonical_path = details
             .canonical_path
             .as_ref()
@@ -5328,6 +5518,8 @@ impl ProjectPanel {
         } else {
             item_colors.hover
         };
+
+        let bg_color = folder_bg_color.unwrap_or(bg_color);
 
         let validation_color_and_message = if show_editor {
             match self
@@ -5729,6 +5921,26 @@ impl ProjectPanel {
                     }
                 }),
             )
+            .when(depth > 0, |this| {
+                // Tree-ASCII style horizontal connector (claude-review-v2
+                // fork): a 1-pixel elbow that meets the existing vertical
+                // indent guide and points at the row's icon. Painted as
+                // an absolutely positioned overlay; the vertical line is
+                // already drawn by `ui::indent_guides`. Cheap — one tiny
+                // div per visible row, only when the row has a parent.
+                let indent = settings.indent_size;
+                let elbow_left = (depth as f32 - 1.0) * indent + indent / 2.0;
+                let elbow_width = indent / 2.0;
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(elbow_left))
+                        .top(relative(0.5))
+                        .w(px(elbow_width))
+                        .h(px(1.0))
+                        .bg(cx.theme().colors().panel_indent_guide),
+                )
+            })
             .child(
                 ListItem::new(id)
                     .indent_level(depth)

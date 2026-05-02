@@ -791,6 +791,67 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: false
     pub git_status_indicator: Option<bool>,
+    /// Rule-based folder background coloring for the project panel
+    /// (claude-review-v2 fork). Each rule matches a folder via any
+    /// combination of `name_pattern` (glob on the folder name),
+    /// `path_glob` (glob on the worktree-relative path),
+    /// `parent_has_files` (folder is colored only when its parent
+    /// directory contains any of these sibling filenames), and
+    /// `contains_files` (folder is colored only when it directly
+    /// contains any of these filenames). Multiple matching rules are
+    /// applied in declaration order; the last match's color wins.
+    ///
+    /// `background_color` can be a hex string (e.g. `"#ff8800"`) or
+    /// a theme-aware token: `blue`, `green`, `orange`, `red`,
+    /// `purple`, `cyan`, `magenta`, `yellow`, `accent`, `created`,
+    /// `modified`, `deleted`, `conflict`. Tokens render as a subtle
+    /// tint over the canvas and adapt to light/dark themes.
+    ///
+    /// Default: a built-in starter set covering Kotlin source
+    /// sets (`*Main` / `*Test` under `src/`), the Kotlin language
+    /// root (`kotlin/` inside `*Main/`), iOS source roots, and
+    /// Gradle module roots (folders containing `build.gradle.kts`).
+    /// To opt out of defaults set this to `[]` (an empty list).
+    pub folder_colors: Option<Vec<FolderColorRuleContent>>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct FolderColorRuleContent {
+    /// Optional human-readable label for the rule (logs / debugging).
+    pub name: Option<String>,
+    /// Glob pattern matched against the folder name (last path
+    /// segment), e.g. `"*Main"` to match any folder ending in `Main`.
+    pub name_pattern: Option<String>,
+    /// Glob pattern matched against the folder's worktree-relative
+    /// unix path, e.g. `"**/src/*Main"`.
+    pub path_glob: Option<String>,
+    /// Rule fires only when the folder's parent directory contains
+    /// at least one of these filenames (e.g. `["build.gradle.kts"]`).
+    pub parent_has_files: Option<Vec<String>>,
+    /// Rule fires only when the folder itself directly contains at
+    /// least one of these filenames.
+    pub contains_files: Option<Vec<String>>,
+    /// Rule fires when the folder OR any of its descendants directly
+    /// contain at least one of these filenames. Useful for "module
+    /// marker"-style tinting where every ancestor up to the project
+    /// root should be highlighted.
+    pub descendant_has_files: Option<Vec<String>>,
+    /// If `Some(true)`, rule fires only for folders that are
+    /// gitignored. If `Some(false)`, only for non-ignored folders.
+    /// `None` (the default) means the rule does not care.
+    pub is_ignored: Option<bool>,
+    /// When true, the rule's color is also applied to every
+    /// descendant entry (files AND folders) of any folder that
+    /// satisfies this rule. Useful for IntelliJ-style "Sources
+    /// Root" coloring where every file under e.g. `src/*Main/kotlin`
+    /// inherits the source-set tint.
+    ///
+    /// Default: false.
+    pub propagate_to_children: Option<bool>,
+    /// Background color for the folder row. Hex (`"#ff8800"`) or
+    /// theme-aware token (`blue`, `accent`, `created`, …).
+    pub background_color: Option<String>,
 }
 
 #[derive(

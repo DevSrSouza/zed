@@ -1,0 +1,86 @@
+[
+  {
+    "name": "gradle-module",
+    "descendant_has_files": ["build.gradle.kts", "build.gradle"],
+    "background_color": "green"
+  },
+  {
+    "name": "kotlin-main-source-set",
+    "name_pattern": "*Main",
+    "path_glob": "**/src/*Main",
+    "background_color": "blue"
+  },
+  {
+    "name": "kotlin-test-source-set",
+    "name_pattern": "*Test",
+    "path_glob": "**/src/*Test",
+    "background_color": "green"
+  },
+  {
+    "name": "kotlin-main-language-root",
+    "name_pattern": "kotlin",
+    "path_glob": "**/src/*Main/kotlin",
+    "background_color": "blue",
+    "propagate_to_children": true
+  },
+  {
+    "name": "kotlin-test-language-root",
+    "name_pattern": "kotlin",
+    "path_glob": "**/src/*Test/kotlin",
+    "background_color": "green",
+    "propagate_to_children": true
+  },
+  {
+    "name": "java-gradle-main-language-root",
+    "name_pattern": "kotlin",
+    "path_glob": "**/src/main/kotlin",
+    "background_color": "blue",
+    "propagate_to_children": true
+  },
+  {
+    "name": "java-gradle-test-language-root",
+    "name_pattern": "kotlin",
+    "path_glob": "**/src/test/kotlin",
+    "background_color": "green",
+    "propagate_to_children": true
+  },
+  {
+    "name": "java-gradle-main-source-set",
+    "name_pattern": "main",
+    "path_glob": "**/src/main",
+    "background_color": "blue"
+  },
+  {
+    "name": "java-gradle-test-source-set",
+    "name_pattern": "test",
+    "path_glob": "**/src/test",
+    "background_color": "green"
+  },
+  {
+    "name": "gradle-build-script",
+    "name_pattern": "build.gradle.kts",
+    "background_color": "yellow"
+  },
+  {
+    "name": "gradle-build-script-groovy",
+    "name_pattern": "build.gradle",
+    "background_color": "yellow"
+  },
+  {
+    "name": "ios-xcode-source-root",
+    "name_pattern": "iosMain",
+    "parent_has_files": ["Package.swift", "project.pbxproj"],
+    "background_color": "orange"
+  },
+  {
+    "name": "gradle-build-output",
+    "name_pattern": "build",
+    "parent_has_files": ["build.gradle.kts", "build.gradle"],
+    "background_color": "red"
+  },
+  {
+    "name": "gitignored",
+    "is_ignored": true,
+    "background_color": "red"
+  }
+]
