@@ -24,10 +24,16 @@ If either gate fails, the panel renders a hint instead of a list. Repository dis
 
 ## PR list panel
 
-- Open PRs sorted by recently-updated (cap: GitHub's default 100/page). Title, `#N`, author, head branch, draft state.
+- PRs sorted by recently-updated. Title, `#N`, author, head branch, draft state.
+- **Pagination**: walks up to 5 pages of 100 (max 500 PRs) via the GitHub `page=N` query param. Stops as soon as a page returns < 100 entries.
+- **Filter bar**:
+  - Search box: case-insensitive substring match on title / author / branch / `#N`. Live as you type.
+  - Author dropdown: trigger shows the selected author's avatar + login (or "Any author"). Click opens a popover with a search input + scrollable list of every distinct author across the loaded PRs. Each row: avatar + login + PR-count badge. **Sorted by PR count descending** (most-active authors at the top), alpha tiebreak. `×` clears the filter; "Any author" entry inside the popover does the same.
+  - State segmented control: `Open` / `Closed` / `All`. Switching re-fetches with the matching `state=` query param.
+  - All filters AND together. Author count badge reflects whatever `state` is currently loaded — switch to `All` for true cross-state totals.
 - Per-row "open in browser" icon.
 - Header refresh button.
-- Auto-refresh on every panel activation (initial reveal, switching back from another panel, restored layout). No periodic poll.
+- Auto-refresh on every panel activation (initial reveal, switching back from another panel, restored layout) and on `GitStoreEvent` (`RepositoryAdded` / `RepositoryUpdated` / `ActiveRepositoryChanged`). No periodic poll.
 - Click a row → opens an overview tab (`PrView`).
 
 ## PR overview tab (`PrView`)
@@ -69,7 +75,7 @@ If either gate fails, the panel renders a hint instead of a list. Repository dis
 
 ## What it does **not** do (yet)
 
-- No filters beyond `state=open`. No author / assignee / reviewer / label filtering. No pagination past the first 100.
+- No assignee / reviewer / label filtering (state + author + free-text search are wired; the others would require GitHub's search API or extra REST roundtrips).
 - No reply-to-existing-thread (a new line comment posts a fresh single-comment review; it doesn't post into an existing GitHub review thread).
 - No resolve / unresolve thread.
 - No webhook or push-based realtime updates — the panel auto-refreshes only on activation, not while it's already open.

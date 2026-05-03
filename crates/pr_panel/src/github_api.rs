@@ -52,6 +52,32 @@ impl RepoCoords {
     }
 }
 
+/// Filter for PR list state. Maps to GitHub's `state=open|closed|all`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrListState {
+    Open,
+    Closed,
+    All,
+}
+
+impl PrListState {
+    pub fn as_query_str(self) -> &'static str {
+        match self {
+            PrListState::Open => "open",
+            PrListState::Closed => "closed",
+            PrListState::All => "all",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PrListState::Open => "Open",
+            PrListState::Closed => "Closed",
+            PrListState::All => "All",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PullRequest {
     pub number: u32,
@@ -156,62 +182,41 @@ impl GitHubClient {
     }
 
     pub async fn list_open_prs(&self, repo: &RepoCoords) -> Result<Vec<PullRequest>> {
-        let url = format!(
-            "{GITHUB_API}/repos/{}/{}/pulls?state=open&per_page=100&sort=updated&direction=desc",
-            repo.owner, repo.repo
-        );
-        let body = self
-            .send_json(&url, "application/vnd.github+json")
-            .await
-            .context("listing open pull requests")?;
-
-        #[derive(Deserialize)]
-        struct RawUser {
-            login: String,
-            avatar_url: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct RawRef {
-            sha: String,
-            #[serde(rename = "ref")]
-            ref_name: String,
-        }
-        #[derive(Deserialize)]
-        struct RawPr {
-            number: u32,
-            title: String,
-            html_url: String,
-            body: Option<String>,
-            user: Option<RawUser>,
-            head: RawRef,
-            base: RawRef,
-            draft: Option<bool>,
-        }
-
-        let raw: Vec<RawPr> = serde_json::from_slice(&body)
-            .with_context(|| format!("decoding PR list response from {url}"))?;
-        Ok(raw
-            .into_iter()
-            .map(|r| {
-                let (login, avatar) = match r.user {
-                    Some(u) => (u.login, u.avatar_url),
-                    None => ("unknown".into(), None),
-                };
-                PullRequest {
-                    number: r.number,
-                    title: r.title.into(),
-                    html_url: r.html_url,
-                    user_login: login.into(),
-                    user_avatar_url: avatar,
-                    head_sha: r.head.sha,
-                    head_ref: r.head.ref_name.into(),
-                    base_ref: r.base.ref_name.into(),
-                    body: r.body.unwrap_or_default(),
-                    draft: r.draft.unwrap_or(false),
-                }
-            })
-            .collect())
+        self.list_prs(repo, PrListState::Open).await
     }
+
+    /// Lists PRs honoring the requested state filter. Walks `Link` headers
+    /// to fetch every page (capped at 500 PRs / 5 pages so we don't pin a
+    /// huge buffer for repos with thousands of historical PRs).
+    pub async fn list_prs(
+        &self,
+        repo: &RepoCoords,
+        state: PrListState,
+    ) -> Result<Vec<PullRequest>> {
+        const PAGE_SIZE: u32 = 100;
+        const MAX_PAGES: u32 = 5;
+
+        let state_param = state.as_query_str();
+        let mut all = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let url = format!(
+                "{GITHUB_API}/repos/{}/{}/pulls?state={}&per_page={}&sort=updated&direction=desc&page={}",
+                repo.owner, repo.repo, state_param, PAGE_SIZE, page
+            );
+            let body = self
+                .send_json(&url, "application/vnd.github+json")
+                .await
+                .with_context(|| format!("listing pull requests page {page}"))?;
+            let batch = decode_pr_list(&body, &url)?;
+            let was_full = batch.len() as u32 >= PAGE_SIZE;
+            all.extend(batch);
+            if !was_full {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
 
     /// Lists check runs (CI workflow steps) attached to a given commit sha.
     /// Used to populate the per-PR CI listing on the overview tab. Status and
@@ -627,6 +632,55 @@ impl GitHubClient {
         }
         Ok(body)
     }
+}
+
+fn decode_pr_list(body: &[u8], url: &str) -> Result<Vec<PullRequest>> {
+    #[derive(Deserialize)]
+    struct RawUser {
+        login: String,
+        avatar_url: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct RawRef {
+        sha: String,
+        #[serde(rename = "ref")]
+        ref_name: String,
+    }
+    #[derive(Deserialize)]
+    struct RawPr {
+        number: u32,
+        title: String,
+        html_url: String,
+        body: Option<String>,
+        user: Option<RawUser>,
+        head: RawRef,
+        base: RawRef,
+        draft: Option<bool>,
+    }
+
+    let raw: Vec<RawPr> = serde_json::from_slice(body)
+        .with_context(|| format!("decoding PR list response from {url}"))?;
+    Ok(raw
+        .into_iter()
+        .map(|r| {
+            let (login, avatar) = match r.user {
+                Some(u) => (u.login, u.avatar_url),
+                None => ("unknown".into(), None),
+            };
+            PullRequest {
+                number: r.number,
+                title: r.title.into(),
+                html_url: r.html_url,
+                user_login: login.into(),
+                user_avatar_url: avatar,
+                head_sha: r.head.sha,
+                head_ref: r.head.ref_name.into(),
+                base_ref: r.base.ref_name.into(),
+                body: r.body.unwrap_or_default(),
+                draft: r.draft.unwrap_or(false),
+            }
+        })
+        .collect())
 }
 
 fn urlencode_path_segment(segment: &str) -> String {
