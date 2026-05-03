@@ -258,6 +258,20 @@ impl LanguageServerTree {
 
         let desired_language_servers =
             settings.customized_language_servers(&available_language_servers);
+
+        // claude-review-v2 fork: opt-in LSP auto-start gate.
+        // Adapters denied by `auto_start_language_servers` (and
+        // not session-overridden via the bottom-bar popover) are
+        // dropped here so the spawn path never sees them — no
+        // tree node, no LanguageServerId, no process. Sits
+        // alongside the existing `enable_language_server: false`
+        // short-circuit above; precedence is documented on
+        // `lsp_store::lsp_auto_start_allowed`.
+        let desired_language_servers: Vec<_> = desired_language_servers
+            .into_iter()
+            .filter(|name| crate::lsp_store::lsp_auto_start_allowed(name, cx))
+            .collect();
+
         let adapters_with_settings = desired_language_servers
             .into_iter()
             .filter_map(|desired_adapter| {

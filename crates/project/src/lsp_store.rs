@@ -286,6 +286,55 @@ struct DynamicRegistrations {
     diagnostics: HashMap<Option<String>, DiagnosticServerCapabilities>,
 }
 
+/// claude-review-v2 fork — JetBrains Fleet "Smart Mode" override
+/// store. Set by the bottom-bar Language Servers popover when
+/// the user clicks "Enable" on a gated server. Backs the
+/// session-only opt-in path: writes here are NOT persisted to
+/// `.zed/settings.json`, they only stay alive while Zed runs.
+///
+/// Composition with the persisted setting
+/// (`auto_start_language_servers`) is documented on
+/// `lsp_auto_start_allowed`.
+#[derive(Clone, Default, Debug)]
+pub struct SessionLspOverrides {
+    /// `true` after the user clicked "Enable all for this session"
+    /// in the popover. Acts as `auto_start_language_servers: true`
+    /// for the running process only.
+    pub force_start_all: bool,
+    /// Servers the user explicitly enabled via per-server
+    /// "Enable" buttons.
+    pub force_start_servers: HashSet<LanguageServerName>,
+}
+
+impl gpui::Global for SessionLspOverrides {}
+
+/// Final auto-start verdict for a language server. Composes the
+/// persisted `ProjectSettings::auto_start_language_servers` field
+/// (read from `.zed/settings.json` / global settings) with the
+/// in-memory `SessionLspOverrides` global the popover writes to.
+///
+/// Order:
+/// 1. Session "Enable all" → run.
+/// 2. Session per-server enable → run.
+/// 3. Persisted setting verdict → run iff allowed.
+///
+/// Note that `enable_language_server: false` (per-language) is
+/// checked even earlier in `LanguageServerTree::adapters_for_language`
+/// and short-circuits before this helper is consulted.
+pub fn lsp_auto_start_allowed(name: &LanguageServerName, cx: &App) -> bool {
+    if let Some(session) = cx.try_global::<SessionLspOverrides>() {
+        if session.force_start_all {
+            return true;
+        }
+        if session.force_start_servers.contains(name) {
+            return true;
+        }
+    }
+    crate::project_settings::ProjectSettings::get_global(cx)
+        .auto_start_language_servers
+        .settings_allows(name)
+}
+
 pub struct LocalLspStore {
     weak: WeakEntity<LspStore>,
     pub worktree_store: Entity<WorktreeStore>,
@@ -11346,6 +11395,59 @@ impl LspStore {
     pub fn restart_all_language_servers(&mut self, cx: &mut Context<Self>) {
         let buffers = self.buffer_store.read(cx).buffers().collect();
         self.restart_language_servers_for_buffers(buffers, HashSet::default(), cx);
+    }
+
+    /// claude-review-v2 fork — session-only Smart Mode toggles.
+    /// Adds `name` to the in-memory `SessionLspOverrides` global
+    /// and re-registers all opened buffers so the now-allowed
+    /// server actually spawns. Not persisted.
+    pub fn enable_language_server_for_session(
+        &mut self,
+        name: LanguageServerName,
+        cx: &mut Context<Self>,
+    ) {
+        let mut overrides = cx
+            .try_global::<SessionLspOverrides>()
+            .cloned()
+            .unwrap_or_default();
+        if !overrides.force_start_servers.insert(name.clone()) {
+            return;
+        }
+        cx.set_global(overrides);
+        self.reregister_open_buffers_for_language_servers(cx);
+    }
+
+    /// claude-review-v2 fork — session-only Smart Mode "Enable
+    /// all". Sets the global flag, then re-registers open buffers
+    /// so every LSP discovered for an open file's language spawns.
+    pub fn enable_all_language_servers_for_session(&mut self, cx: &mut Context<Self>) {
+        let mut overrides = cx
+            .try_global::<SessionLspOverrides>()
+            .cloned()
+            .unwrap_or_default();
+        if overrides.force_start_all {
+            return;
+        }
+        overrides.force_start_all = true;
+        cx.set_global(overrides);
+        self.reregister_open_buffers_for_language_servers(cx);
+    }
+
+    fn reregister_open_buffers_for_language_servers(&mut self, cx: &mut Context<Self>) {
+        let buffers: Vec<Entity<Buffer>> = self.buffer_store.read(cx).buffers().collect();
+        for buffer in buffers {
+            // ignore_refcounts=true so the spawn-or-skip walk
+            // runs even if the buffer's already registered. The
+            // walk hits `adapters_for_language`, which now sees
+            // the override and yields the previously-gated
+            // adapter, triggering its spawn.
+            let _ = self.register_buffer_with_language_servers(
+                &buffer,
+                HashSet::default(),
+                true,
+                cx,
+            );
+        }
     }
 
     pub fn restart_language_servers_for_buffers(

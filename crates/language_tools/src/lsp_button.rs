@@ -14,7 +14,7 @@ use client::proto;
 use collections::HashSet;
 use editor::{Editor, EditorEvent};
 use gpui::{Anchor, Entity, Subscription, Task, WeakEntity, actions};
-use language::{BinaryStatus, BufferId, ServerHealth};
+use language::{BinaryStatus, BufferId, LanguageName, ServerHealth};
 use lsp::{LanguageServerId, LanguageServerName, LanguageServerSelector};
 use project::{
     LspStore, LspStoreEvent, Worktree, lsp_store::log_store::GlobalLogStore,
@@ -53,6 +53,17 @@ struct LanguageServerState {
     active_editor: Option<ActiveEditor>,
     language_servers: LanguageServers,
     process_memory_cache: Rc<RefCell<ProcessMemoryCache>>,
+    /// claude-review-v2 fork — Smart Mode UI: language servers
+    /// that COULD spawn for an active buffer's language but are
+    /// gated off by `auto_start_language_servers`. Populated in
+    /// `regenerate_items` and rendered by `fill_menu` as a
+    /// "Smart Mode disabled" section with "Enable" buttons.
+    gated_servers: Vec<LanguageServerName>,
+    /// claude-review-v2 fork — `.lsp.json` files Zed discovered
+    /// across all worktrees. Each `.lsp.json` declares zero or
+    /// more language-server overrides and the popover lists each
+    /// declared server as an opt-in row.
+    detected_lsp_json_paths: Vec<PathBuf>,
 }
 
 impl std::fmt::Debug for LanguageServerState {
@@ -220,6 +231,125 @@ impl LanguageServerState {
         let Some(lsp_logs) = lsp_logs else {
             return menu;
         };
+
+        // claude-review-v2 fork — Smart Mode section.
+        //
+        // Always rendered when the persisted setting
+        // `auto_start_language_servers` is anything other than
+        // `true`, regardless of whether a buffer is open. The
+        // user must have a discoverable place to opt in / opt
+        // out at any time.
+        //
+        // Buttons here mutate the in-memory `SessionLspOverrides`
+        // global only — they do NOT write to settings. Closing
+        // and reopening Zed resets to whatever the persisted
+        // setting says. To make the opt-in stick, set
+        // `auto_start_language_servers: true` in
+        // `.zed/settings.json`.
+        let smart_mode_active = matches!(
+            project::project_settings::ProjectSettings::get_global(cx)
+                .auto_start_language_servers,
+            project::project_settings::AutoStartConfig::All(true)
+        );
+        let session_overrides = cx
+            .try_global::<project::lsp_store::SessionLspOverrides>()
+            .cloned()
+            .unwrap_or_default();
+        if !smart_mode_active {
+            menu = menu.header("Smart Mode");
+
+            if session_overrides.force_start_all {
+                // User already clicked "Enable all". Clearly
+                // reflect that — no more Enable button to click.
+                menu = menu.label(
+                    "✓ All servers enabled for this session. Reverts to opt-in on next Zed restart.",
+                );
+                menu = menu.label(
+                    "Persist by setting auto_start_language_servers: true in .zed/settings.json.",
+                );
+            } else {
+                menu = menu.label(
+                    "Language servers don't auto-start. Click Enable to spawn for this Zed session.",
+                );
+                menu = menu.label(
+                    "Persist by setting auto_start_language_servers: true in .zed/settings.json.",
+                );
+                // claude-review-v2 fork — surface that we
+                // detected one or more `.lsp.json` files. Each
+                // declares a language-server override (Claude
+                // Code-compatible schema); Enable launches
+                // exactly that server with the binary / args /
+                // env / settings configured in the JSON file.
+                if !self.detected_lsp_json_paths.is_empty() {
+                    let count = self.detected_lsp_json_paths.len();
+                    let prefix = if count == 1 {
+                        "1 .lsp.json detected".to_string()
+                    } else {
+                        format!("{count} .lsp.json files detected")
+                    };
+                    menu = menu.label(format!(
+                        "{prefix} — Enable launches the configured server(s) using their command, args, env, and settings from the .lsp.json file.",
+                    ));
+                }
+
+                let lsp_store_for_all = self.lsp_store.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Enable all servers for this session")
+                        .icon(IconName::BoltOutlined)
+                        .icon_color(Color::Accent)
+                        .handler(move |_, cx| {
+                            lsp_store_for_all
+                                .update(cx, |lsp_store, cx| {
+                                    lsp_store.enable_all_language_servers_for_session(cx);
+                                })
+                                .ok();
+                        }),
+                );
+
+                let pending_per_server: Vec<&LanguageServerName> = self
+                    .gated_servers
+                    .iter()
+                    .filter(|name| !session_overrides.force_start_servers.contains(*name))
+                    .collect();
+                if pending_per_server.is_empty() {
+                    if self.gated_servers.is_empty() {
+                        menu = menu.label(
+                            "Open a file in a language with an installed LSP to see per-server Enable buttons.",
+                        );
+                    } else {
+                        // All known servers are session-enabled,
+                        // but they may not have spawned yet (so
+                        // they don't appear under "running" yet).
+                        menu = menu.label(
+                            "✓ All detected servers enabled for this session.",
+                        );
+                    }
+                } else {
+                    for server_name in pending_per_server {
+                        let label = SharedString::from(server_name.0.clone());
+                        let lsp_store_for_server = self.lsp_store.clone();
+                        let server_name = server_name.clone();
+                        menu = menu.item(
+                            ContextMenuEntry::new(format!("Enable {label}"))
+                                .icon(IconName::BoltOutlined)
+                                .icon_color(Color::Muted)
+                                .handler(move |_, cx| {
+                                    let server_name = server_name.clone();
+                                    lsp_store_for_server
+                                        .update(cx, |lsp_store, cx| {
+                                            lsp_store.enable_language_server_for_session(
+                                                server_name,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                }),
+                        );
+                    }
+                }
+            }
+            menu = menu.separator();
+        }
 
         let server_metadata = self
             .lsp_store
@@ -823,6 +953,19 @@ impl LspButton {
             active_editor: None,
             language_servers,
             process_memory_cache: Rc::new(RefCell::new(ProcessMemoryCache::new())),
+            gated_servers: Vec::new(),
+            detected_lsp_json_paths: Vec::new(),
+        });
+
+        // claude-review-v2 fork — refresh the popover when the
+        // user clicks Enable in our Smart Mode section. The
+        // handler mutates the `SessionLspOverrides` global; this
+        // subscription rebuilds the gated-servers list so the
+        // popover removes rows for servers it just enabled.
+        let session_overrides_subscription = cx.observe_global_in::<
+            project::lsp_store::SessionLspOverrides,
+        >(window, move |lsp_button, window, cx| {
+            lsp_button.refresh_lsp_menu(false, window, cx);
         });
 
         let mut lsp_button = Self {
@@ -830,17 +973,17 @@ impl LspButton {
             popover_menu_handle,
             lsp_menu: None,
             lsp_menu_refresh: Task::ready(()),
-            _subscriptions: vec![settings_subscription, lsp_store_subscription],
+            _subscriptions: vec![
+                settings_subscription,
+                lsp_store_subscription,
+                session_overrides_subscription,
+            ],
         };
-        if !lsp_button
-            .server_state
-            .read(cx)
-            .language_servers
-            .binary_statuses
-            .is_empty()
-        {
-            lsp_button.refresh_lsp_menu(true, window, cx);
-        }
+        // claude-review-v2 fork — always build the menu on init
+        // so the Smart Mode section is reachable from the moment
+        // the workspace opens, even before any language server
+        // would have been considered.
+        lsp_button.refresh_lsp_menu(true, window, cx);
 
         lsp_button
     }
@@ -1126,6 +1269,135 @@ impl LspButton {
             }
 
             state.items = new_lsp_items;
+
+            // claude-review-v2 fork — Smart Mode (opt-in LSP
+            // auto-start). Compute language servers that COULD
+            // spawn for either:
+            //   1. an open buffer's language — via
+            //      `LanguageRegistry::lsp_adapters`,
+            //   2. any `.lsp.json` discovered across the
+            //      workspace — keys of those JSON objects are
+            //      language-server names by Claude Code spec.
+            //
+            // Both sources feed the popover's Smart Mode
+            // section as "Enable" rows.
+            let mut buffer_languages: Vec<LanguageName> = Vec::new();
+            if let Some(active_editor) = state.active_editor.as_ref()
+                && let Some(editor) = active_editor.editor.upgrade()
+            {
+                editor
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .all_buffers()
+                    .iter()
+                    .filter_map(|buffer| buffer.read(cx).language().cloned())
+                    .for_each(|language| {
+                        let name = language.name();
+                        if !buffer_languages.contains(&name) {
+                            buffer_languages.push(name);
+                        }
+                    });
+            }
+            let registry = state
+                .lsp_store
+                .update(cx, |lsp_store, _| lsp_store.languages.clone())
+                .ok();
+
+            // Walk visible worktrees collecting any `.lsp.json`
+            // path. These are tiny (few KB at most) and indexed
+            // by the worktree scanner so iteration is cheap.
+            let (lsp_json_paths, lsp_json_servers) = state
+                .lsp_store
+                .update(cx, |lsp_store, cx| {
+                    let mut paths: Vec<PathBuf> = Vec::new();
+                    let mut servers: Vec<LanguageServerName> = Vec::new();
+                    let mut seen_servers: HashSet<LanguageServerName> = HashSet::default();
+                    let worktree_store = lsp_store.worktree_store().clone();
+                    let worktrees: Vec<Entity<project::Worktree>> = worktree_store
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .collect();
+                    for worktree in worktrees {
+                        let snapshot = worktree.read(cx).snapshot();
+                        let abs_root = snapshot.abs_path().to_path_buf();
+                        for entry in snapshot.entries(false, 0) {
+                            if entry.is_dir() {
+                                continue;
+                            }
+                            let path = &entry.path;
+                            let last = match path.as_unix_str().rsplit('/').next() {
+                                Some(s) => s,
+                                None => continue,
+                            };
+                            if last != ".lsp.json" {
+                                continue;
+                            }
+                            let abs = {
+                                let mut p = abs_root.clone();
+                                let rel = path.as_unix_str();
+                                if !rel.is_empty() {
+                                    p.push(rel);
+                                }
+                                p
+                            };
+                            let parent_for_read = abs.parent().map(Path::to_path_buf);
+                            paths.push(abs);
+                            if let Some(parent) = parent_for_read
+                                && let Some(file) = project::lsp_json::read_lsp_json(&parent)
+                            {
+                                for key in file.keys() {
+                                    let name = LanguageServerName::from_proto(key.clone());
+                                    if seen_servers.insert(name.clone()) {
+                                        servers.push(name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (paths, servers)
+                })
+                .unwrap_or_default();
+
+            let gated = {
+                let running: HashSet<LanguageServerName> = state
+                    .language_servers
+                    .health_statuses
+                    .values()
+                    .map(|h| h.name.clone())
+                    .chain(state.language_servers.binary_statuses.keys().cloned())
+                    .collect();
+                let mut seen: HashSet<LanguageServerName> = HashSet::default();
+                let mut out: Vec<LanguageServerName> = Vec::new();
+                let mut consider = |name: LanguageServerName,
+                                    seen: &mut HashSet<LanguageServerName>,
+                                    out: &mut Vec<LanguageServerName>,
+                                    running: &HashSet<LanguageServerName>| {
+                    if !seen.insert(name.clone()) {
+                        return;
+                    }
+                    if running.contains(&name) {
+                        return;
+                    }
+                    if project::lsp_store::lsp_auto_start_allowed(&name, cx) {
+                        return;
+                    }
+                    out.push(name);
+                };
+                if let Some(registry) = registry {
+                    for language_name in buffer_languages {
+                        for adapter in registry.lsp_adapters(&language_name) {
+                            consider(adapter.name(), &mut seen, &mut out, &running);
+                        }
+                    }
+                }
+                for name in lsp_json_servers {
+                    consider(name, &mut seen, &mut out, &running);
+                }
+                out
+            };
+            state.gated_servers = gated;
+            state.detected_lsp_json_paths = lsp_json_paths;
         });
     }
 
@@ -1252,11 +1524,17 @@ impl StatusItemView for LspButton {
 
 impl Render for LspButton {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl ui::IntoElement {
-        if self.server_state.read(cx).language_servers.is_empty() || self.lsp_menu.is_none() {
+        // claude-review-v2 fork — Smart Mode entry point must
+        // be discoverable from anywhere, so the pill renders
+        // unconditionally as long as the menu has been built.
+        // The popover itself documents what Smart Mode is.
+        if self.lsp_menu.is_none() {
             return div().hidden();
         }
-
         let state = self.server_state.read(cx);
+        let nothing_running = state.language_servers.is_empty();
+        let nothing_gated = state.gated_servers.is_empty();
+
         let is_via_ssh = state
             .workspace
             .upgrade()
@@ -1296,6 +1574,13 @@ impl Render for LspButton {
             (
                 Some(Indicator::dot().color(Color::Modified)),
                 "Server with notifications",
+            )
+        } else if nothing_running && !nothing_gated {
+            // Smart Mode off, ≥1 adapter would spawn but is
+            // gated. Surface as a soft indicator.
+            (
+                Some(Indicator::dot().color(Color::Disabled)),
+                "Smart Mode disabled",
             )
         } else {
             (None, "All Servers Operational")

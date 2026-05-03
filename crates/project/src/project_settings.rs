@@ -88,6 +88,45 @@ pub struct ProjectSettings {
     /// language built-in manifest provider so only marker
     /// files can pin a root.
     pub lsp_root_disable_builtin_manifest_providers: bool,
+
+    /// claude-review-v2 fork: opt-in language-server auto-start.
+    /// See `auto_start_language_servers` in settings.json.
+    pub auto_start_language_servers: AutoStartConfig,
+}
+
+/// claude-review-v2 fork — see field docs on
+/// `ProjectSettingsContent::auto_start_language_servers`.
+/// Resolved form of `AutoStartLanguageServersContent`.
+#[derive(Clone, Debug)]
+pub enum AutoStartConfig {
+    All(bool),
+    PerServer {
+        default: bool,
+        overrides: HashMap<LanguageServerName, bool>,
+    },
+}
+
+impl Default for AutoStartConfig {
+    fn default() -> Self {
+        // Strict opt-in: by default no server auto-starts.
+        AutoStartConfig::All(false)
+    }
+}
+
+impl AutoStartConfig {
+    /// `true` iff the persisted setting alone allows the named
+    /// server to auto-spawn. Session-level overrides (e.g. the
+    /// "Enable" buttons in the Language Servers popover) are
+    /// applied higher up by `LspStore::lsp_auto_start_allowed`.
+    pub fn settings_allows(&self, name: &LanguageServerName) -> bool {
+        match self {
+            AutoStartConfig::All(b) => *b,
+            AutoStartConfig::PerServer {
+                default,
+                overrides,
+            } => overrides.get(name).copied().unwrap_or(*default),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -749,6 +788,23 @@ impl Settings for ProjectSettings {
                 .as_ref()
                 .and_then(|r| r.disable_builtin_manifest_providers)
                 .unwrap_or(false),
+            auto_start_language_servers: {
+                use settings::settings_content::AutoStartLanguageServersContent;
+                match project.auto_start_language_servers.clone() {
+                    None => AutoStartConfig::All(false),
+                    Some(AutoStartLanguageServersContent::All(b)) => AutoStartConfig::All(b),
+                    Some(AutoStartLanguageServersContent::PerServer(map)) => {
+                        AutoStartConfig::PerServer {
+                            default: map.default.unwrap_or(false),
+                            overrides: map
+                                .overrides
+                                .into_iter()
+                                .map(|(k, v)| (LanguageServerName::from_proto(k), v))
+                                .collect(),
+                        }
+                    }
+                }
+            },
         }
     }
 }

@@ -474,3 +474,88 @@ Trade-offs:
 - Symbolic linking would be lighter-weight but breaks across filesystems and on Windows. Extraction wins on portability.
 
 Implementation: `crates/project/src/jar_extract.rs`, hooked into `LspStore::open_local_buffer_via_lsp` so every LSP-driven buffer open benefits, not just Go-to-Definition.
+
+# Smart Mode — Opt-in LSP Auto-Start
+
+JetBrains Fleet ships a "Smart Mode" toggle: code intelligence is opt-in, so opening a repository for read-only browsing doesn't pay the multi-hundred-MB startup cost of a heavyweight language server (kotlin-lsp, sourcekit-lsp, rust-analyzer). This fork brings the same affordance to Zed.
+
+## Default behavior
+
+By default Zed will **not** auto-start any language server. The bottom-bar **Language Servers** pill is always visible; clicking it opens a popover that explains Smart Mode and lists every LSP it could start.
+
+The pill renders unconditionally (not only when servers are running) so the entry point stays discoverable from a fresh workspace open with zero buffers loaded.
+
+## Opt-in mechanisms
+
+Two ways to turn LSPs on:
+
+1. **Per-session, click to enable.** Open the Language Servers popover and pick one of:
+   - **Enable all servers for this session** — flips the in-memory `SessionLspOverrides::force_start_all` global to `true`. Every gated adapter spawns immediately.
+   - **Enable `<server-name>`** — flips `SessionLspOverrides::force_start_servers` for that one adapter only. Useful when one expensive server stays off while a cheaper one runs.
+
+   Session overrides are **not** persisted. Closing Zed clears them; on next launch the user is back at the strict opt-in default.
+
+2. **Persistently, via `.zed/settings.json`** (or global settings). Set `auto_start_language_servers`:
+
+   ```json
+   { "auto_start_language_servers": true }                 // all servers auto-start
+   { "auto_start_language_servers": false }                // (default) none auto-start
+   { "auto_start_language_servers": {                      // per-server
+       "json-language-server": true,
+       "kotlin-lsp": false
+   } }
+   { "auto_start_language_servers": {                      // map with default
+       "default": true,
+       "kotlin-lsp": false
+   } }
+   ```
+
+   Resolution: per-server entry wins over `default`; missing both → `false` (strict opt-in).
+
+## Workspace discovery
+
+The popover lists every gated server it can find in the current workspace. Two sources feed the list:
+
+- **Active editor's open buffers.** For each buffer's language, we call `LanguageRegistry::lsp_adapters(language)` and collect what would have spawned. This is buffer-driven so the list grows as the user opens more files.
+- **`.lsp.json` discovery.** Every `.lsp.json` (Claude Code-compatible LSP manifest, see the section above) anywhere in the worktree is parsed; its top-level keys are language-server names. Each one becomes an Enable row in the popover, with a description noting that Enable will launch the server using the binary / args / env / settings the JSON file declared.
+
+`.lsp.json` discovery is the primary source — it's authoritative, fast (worktree paths are already indexed by Zed's scanner; reading the small JSON files is cheap), and works before the user has opened any buffer.
+
+## Popover states
+
+The popover header is always **Smart Mode** when the persisted setting isn't `true`. Below it:
+
+- Description lines — "Language servers don't auto-start. Click Enable to spawn for this Zed session." plus a hint to persist via `.zed/settings.json`.
+- A `.lsp.json detected` line when one or more were found, explaining that Enable launches the configured server(s) using the JSON file's overrides.
+- Either:
+  - The **Enable all servers for this session** button + per-server Enable rows, or
+  - **✓ All servers enabled for this session** when `force_start_all` is on (the bulk button has done its job and is replaced with a status line — no longer a clickable affordance, so the user knows there's nothing left to do).
+- Per-server rows hide themselves once the user has flipped that server on; if every detected server is enabled but the bulk toggle wasn't used, the section shows **✓ All detected servers enabled for this session.**
+
+When `auto_start_language_servers: true` is set persistently, the Smart Mode section is omitted entirely and the popover behaves like stock Zed.
+
+## Spawn gate
+
+The actual gate sits in `LanguageServerTree::adapters_for_language` (`crates/project/src/manifest_tree/server_tree.rs`), right next to the existing `enable_language_server: false` short-circuit. Adapters denied by the persisted setting + session overrides drop out of the iterator before any spawn-or-init machinery runs — no zombie tree node, no fake `LanguageServerId`, no orphaned config state.
+
+Precedence:
+
+1. `enable_language_server: false` (per-language) → never run, beats everything.
+2. Session "Enable all" → run.
+3. Session per-server enable → run.
+4. `auto_start_language_servers` persisted setting → final answer.
+
+When a session override flips on, `LspStore::enable_*_for_session` mutates the global and re-runs `register_buffer_with_language_servers` for every open buffer with `ignore_refcounts: true`, so the previously-gated adapter actually spawns without requiring the user to reopen the file.
+
+## Trade-offs
+
+- **No "disable for session" in v1.** Once turned on, a session override stays on until Zed restarts (since session overrides don't persist). To "disable", quit Zed.
+- **Extension-installed adapters** are loaded lazily by Zed (`LanguageRegistry::load_available_lsp_adapter`) and may not appear in `lsp_adapters()` until first referenced. Effect: an extension's adapter may not show up in the buffer-driven list until the user has at least once opened a file in that language. `.lsp.json` discovery sidesteps this — JSON keys are surfaced even before the adapter loads.
+- **Per-buffer-language detection only** for `LanguageRegistry`-sourced rows. We deliberately don't scan the worktree by file extension to suggest adapters; that would be expensive and noisy in big repos. `.lsp.json` is the explicit "this project uses these LSPs" signal.
+
+Implementation:
+- `crates/settings_content/src/project.rs` — `auto_start_language_servers` field + `AutoStartLanguageServersContent` enum.
+- `crates/project/src/project_settings.rs` — resolved `AutoStartConfig` + `From` mapping.
+- `crates/project/src/manifest_tree/server_tree.rs` — spawn gate.
+- `crates/project/src/lsp_store.rs` — `SessionLspOverrides` global, `lsp_auto_start_allowed` helper, `enable_*_for_session` mutators, re-registration plumbing.
+- `crates/language_tools/src/lsp_button.rs` — popover Smart Mode section, `.lsp.json` discovery, gated-adapter listing, always-render pill.

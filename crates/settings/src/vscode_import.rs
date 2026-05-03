@@ -521,6 +521,7 @@ impl VsCodeSettings {
             git_hosting_providers: None,
             disable_ai: None,
             lsp_root: None,
+            auto_start_language_servers: None,
         }
     }
 

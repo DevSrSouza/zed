@@ -94,6 +94,48 @@ pub struct ProjectSettingsContent {
     /// (e.g. searching for `Cargo.toml` / `build.gradle.kts`)
     /// finds the wrong root.
     pub lsp_root: Option<LspRootSettingsContent>,
+
+    /// Opt-in language server auto-start (claude-review-v2 fork).
+    /// JetBrains Fleet-style "Smart Mode": when this is omitted or
+    /// `false`, no language server processes spawn automatically;
+    /// the user opts in per-session via the Language Servers
+    /// popover or persistently by setting this field. Per-server
+    /// granularity is supported so cheap servers (json, yaml) can
+    /// auto-start while expensive ones (kotlin-lsp, sourcekit-lsp)
+    /// stay opt-in.
+    ///
+    /// Forms:
+    /// - `true` — every server auto-starts (matches stock Zed).
+    /// - `false` (default) — no server auto-starts.
+    /// - `{ "kotlin-lsp": false, "json-language-server": true }` —
+    ///   per-server map. Servers not listed fall back to `default`
+    ///   (or `false` if `default` is absent).
+    /// - `{ "default": true, "kotlin-lsp": false }` — every server
+    ///   auto-starts except the listed ones.
+    pub auto_start_language_servers: Option<AutoStartLanguageServersContent>,
+}
+
+/// claude-review-v2 fork — see `auto_start_language_servers` field
+/// on `ProjectSettingsContent`. The `serde(untagged)` enum lets the
+/// user write the most natural form for their case (plain bool,
+/// per-server map, or map-with-default).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(untagged)]
+pub enum AutoStartLanguageServersContent {
+    All(bool),
+    PerServer(AutoStartLanguageServersMap),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct AutoStartLanguageServersMap {
+    /// Fallback verdict for servers not in `overrides`. Absent →
+    /// `false` (strict opt-in for unlisted servers).
+    pub default: Option<bool>,
+    /// Per-server enable/disable. Keys are language-server names
+    /// (e.g. `"kotlin-lsp"`, `"json-language-server"`,
+    /// `"sourcekit-lsp"`).
+    #[serde(flatten)]
+    pub overrides: HashMap<String, bool>,
 }
 
 #[with_fallible_options]
