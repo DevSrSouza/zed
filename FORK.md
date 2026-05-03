@@ -400,3 +400,59 @@ The generated `.compile` and `buildServer.json` end up in the cwd — repo root.
   ```
   Optionally point `XBS_LOGPATH=/tmp/xbs.log` in the `.lsp.json` `env` block to capture the BSP request/response trace.
 - **Confirm sourcekit-lsp isn't on fallback**: `log show --predicate 'subsystem == "org.swift.sourcekit-lsp"' --last 5m | grep fallback`. Any "fallback build settings" hit on a file you care about means BSP wiring is broken for that file.
+
+# KMP — Swift→Kotlin Go-to-Definition
+
+In a Kotlin Multiplatform project, Kotlin types exported via the `Shared` (or any other) framework appear in Swift as ObjC-imported types: `import Shared` then reference `BarPresenter`, `Foo`, etc. Stock sourcekit-lsp resolves Go-to-Definition on these to one of two synthesized targets:
+
+- `<TempDir>/sourcekit-lsp/GeneratedInterfaces/<hash>/<Module>.swiftinterface` — Swift-style stub
+- `<DerivedData>/Build/Products/<config>-<sdk>/<Module>.framework/Headers/<Module>.h` — ObjC header (with the framework name prefixed onto every type, e.g. `SharedBarPresenter`)
+
+Neither is the actual source. In a KMP project the truth is the `.kt` file the framework was compiled from.
+
+This fork transparently redirects those targets to the originating Kotlin source by:
+
+1. Detecting that the Go-to-Definition target points at one of the two synthesized locations above.
+2. Reading the symbol identifier at that location (peeling off the framework prefix when present — `SharedBarPresenter` → `BarPresenter`).
+3. Sending `workspace/symbol` to the kotlin-lsp running in the same workspace.
+4. Picking the best match (exact name; preferring `commonMain` over platform-specific source sets).
+5. Replacing the LSP response with the Kotlin source location before Zed opens the buffer.
+
+If kotlin-lsp is not running, returns no exact match, or the redirect fails for any other reason, the original swiftinterface / header location is used (existing behavior). No setting; activates whenever both `sourcekit-lsp` and `kotlin-lsp` are configured for the worktree.
+
+Limits in v1:
+
+- `@ObjCName` renames lose the link (Kotlin `Foo` annotated as `KFoo` in ObjC won't be found by name). A build-time Kotlin↔ObjC index would close this gap.
+- Generic erasure across the ObjC bridge — `BarPresenter<Model>` resolves to `BarPresenter`. Still finds the right declaration; type parameters aren't carried over.
+- Symbols with the same name in multiple Kotlin files fall back to the `commonMain`-preferred match. For multi-actual KMP types this is usually right, but not always.
+
+Implementation: `crates/project/src/kmp_swift_to_kotlin.rs`. Hook lives in `lsp_command::location_links_from_lsp` and runs before LSP `Location` → Zed `Location` conversion, so it composes with everything downstream (preview, multi-buffer, peek-definition, etc.).
+
+Debug: `tail -f ~/Library/Logs/Zed/Zed.log | grep kmp_swift_to_kotlin` shows `redirecting <swiftinterface-or-header> (<raw-symbol> -> <stripped-symbol>) -> <kt-uri>` on hits, `redirect failed: ...` on misses.
+
+# JVM Library Sources — `<jar>!/<entry>` Path Support
+
+When kotlin-lsp / jdtls / any JVM language server resolves Go-to-Definition into a third-party dependency, it returns paths in the JVM archive convention:
+
+```
+/Users/<you>/.gradle/caches/modules-2/files-2.1/.../kotlinx-coroutines-core-jvm-1.10.2-sources.jar!/commonMain/kotlinx/coroutines/CoroutineScope.kt
+```
+
+The `!/` separator points inside a `.jar` — there's no real file at that path, so stock Zed errored with **"Failed to open …"**.
+
+This fork detects the `<archive>.jar!/<entry>` shape, extracts the requested entry once into a per-jar cache, and opens the cached file with the standard buffer flow. Result: clicking through into `CoroutineScope`, `Flow`, any third-party `.kt`/`.java` source, just works.
+
+Cache location: `<data_dir>/jar-extracts/<sha-prefix>/<entry-relative-path>`.
+
+- macOS: `~/Library/Application Support/Zed/jar-extracts/`
+- Linux: `~/.local/share/zed/jar-extracts/`
+
+Cached files are chmod'd `0o444` (Unix) or marked read-only (Windows) so stray edits don't accidentally diverge from the upstream archive. Re-extracted automatically when the source jar's mtime is newer than the cache file.
+
+Trade-offs:
+
+- The opened buffer is a real on-disk file in the cache, not a virtual one. Editor features (search, outline, find references inside the file, language-aware navigation) work normally.
+- The cache grows as you navigate dependencies. Manual cleanup: `rm -rf ~/Library/Application\ Support/Zed/jar-extracts/`. No automatic GC in v1 — cache is small relative to source archives and is content-addressed by jar path so it dedupes naturally.
+- Symbolic linking would be lighter-weight but breaks across filesystems and on Windows. Extraction wins on portability.
+
+Implementation: `crates/project/src/jar_extract.rs`, hooked into `LspStore::open_local_buffer_via_lsp` so every LSP-driven buffer open benefits, not just Go-to-Definition.

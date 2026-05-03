@@ -9,6 +9,8 @@ pub mod debounced_delay;
 pub mod debugger;
 pub mod git_store;
 pub mod image_store;
+pub mod jar_extract;
+pub mod kmp_swift_to_kotlin;
 pub mod lsp_command;
 pub mod lsp_json;
 pub mod lsp_store;

@@ -1176,6 +1176,32 @@ pub async fn location_links_from_lsp(
         }
     }
 
+    // claude-review-v2 fork: KMP Swift→Kotlin redirect. When sourcekit-
+    // lsp resolved a Swift symbol to a synthesized `.swiftinterface`
+    // (the ObjC bridge over a Kotlin Multiplatform-exported framework),
+    // ask kotlin-lsp where the originating `.kt` declaration is and
+    // swap the target. Falls back to the swiftinterface on miss.
+    {
+        let weak_lsp_store = lsp_store.downgrade();
+        let mut redirected = Vec::with_capacity(unresolved_links.len());
+        for (origin, target_uri, target_range) in unresolved_links.drain(..) {
+            if let Some((new_uri, new_range)) =
+                crate::kmp_swift_to_kotlin::redirect_swiftinterface_to_kotlin(
+                    &target_uri,
+                    target_range,
+                    &weak_lsp_store,
+                    &mut cx,
+                )
+                .await
+            {
+                redirected.push((origin, new_uri, new_range));
+            } else {
+                redirected.push((origin, target_uri, target_range));
+            }
+        }
+        unresolved_links = redirected;
+    }
+
     let (_, language_server) = language_server_for_buffer(&lsp_store, &buffer, server_id, &mut cx)?;
     let mut definitions = Vec::new();
     for (origin_range, target_uri, target_range) in unresolved_links {

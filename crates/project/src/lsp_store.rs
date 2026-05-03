@@ -8942,6 +8942,23 @@ impl LspStore {
             let abs_path = abs_path
                 .to_file_path_ext(path_style)
                 .map_err(|()| anyhow!("can't convert URI to path"))?;
+
+            // claude-review-v2 fork: when the LSP returned a path
+            // pointing inside a `.jar` source archive (kotlin-lsp /
+            // jdtls / etc. do this for dependency sources), extract
+            // the entry into a per-jar cache and continue the open
+            // flow against the real cached file. Plain on-disk paths
+            // fall through unchanged. See crate::jar_extract.
+            let abs_path = if let Some((jar, entry)) =
+                crate::jar_extract::parse_jar_path(&abs_path)
+            {
+                crate::jar_extract::extract_to_cache(&jar, &entry)
+                    .await
+                    .with_context(|| format!("opening jar entry {}!{}", jar.display(), entry))?
+            } else {
+                abs_path
+            };
+
             let p = abs_path.clone();
             let yarn_worktree = lsp_store
                 .update(cx, move |lsp_store, cx| match lsp_store.as_local() {
