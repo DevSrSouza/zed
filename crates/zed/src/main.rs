@@ -649,6 +649,11 @@ fn main() {
         );
         command_palette::init(cx);
         search_everywhere::init(cx);
+        // claude-review-v2 fork — Smart Mode symbol cache.
+        // Spawns a per-project background sweep that records
+        // `workspace/symbol` results into the project index so
+        // navigation works after Zed restarts without LSPs.
+        project_index::init(cx);
         let copilot_chat_configuration = copilot_chat::CopilotChatConfiguration {
             enterprise_uri: language::language_settings::all_language_settings(None, cx)
                 .edit_predictions

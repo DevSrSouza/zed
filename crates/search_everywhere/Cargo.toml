@@ -14,10 +14,12 @@ path = "src/search_everywhere.rs"
 
 [dependencies]
 anyhow.workspace = true
+collections.workspace = true
 editor.workspace = true
 fuzzy_nucleo.workspace = true
 futures.workspace = true
 log.workspace = true
+project_index.workspace = true
 gpui.workspace = true
 picker.workspace = true
 project.workspace = true

@@ -1,0 +1,33 @@
+[package]
+name = "project_index"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[features]
+test-support = ["db/test-support"]
+
+[lib]
+path = "src/project_index.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+db.workspace = true
+gpui.workspace = true
+language.workspace = true
+log.workspace = true
+lsp.workspace = true
+project.workspace = true
+util.workspace = true
+workspace.workspace = true
+worktree.workspace = true
+
+[dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }

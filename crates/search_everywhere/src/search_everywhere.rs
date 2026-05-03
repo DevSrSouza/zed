@@ -30,7 +30,9 @@ use gpui::{
 };
 use picker::{Picker, PickerDelegate};
 use project::{Candidates, PathMatchCandidateSet, ProjectPath, Symbol};
+use project_index::{CachedSymbol, ProjectIndexDB, fts_prefix_query};
 use std::cmp::Ordering;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use ui::{
@@ -115,6 +117,7 @@ impl SearchEverywhereModal {
             matches: Vec::new(),
             phase1_hits: Vec::new(),
             symbol_hits: Vec::new(),
+            cached_hits: Vec::new(),
             selected_ix: 0,
             previous_focus,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -196,6 +199,9 @@ impl SearchEverywhereModal {
                     } else {
                         symbol.name.chars().count() + 5 + path.chars().count()
                     }
+                }
+                Hit::CachedSymbol { symbol, .. } => {
+                    symbol.name.chars().count() + 5 + symbol.rel_path.chars().count()
                 }
                 Hit::Action { entry, .. } => entry.display.chars().count(),
                 Hit::File { path_match } => compose_path_label(path_match).chars().count(),
@@ -350,6 +356,14 @@ enum Hit {
         symbol: Symbol,
         name_positions: Vec<usize>,
     },
+    /// claude-review-v2 fork — Smart Mode cache hit. Surfaced
+    /// when the persistent symbol index has a match the live
+    /// LSP didn't (or while LSPs aren't running). Confirm
+    /// opens the file at the cached range.
+    CachedSymbol {
+        symbol: CachedSymbol,
+        name_positions: Vec<usize>,
+    },
     Action {
         entry: ActionEntry,
         positions: Vec<usize>,
@@ -373,6 +387,11 @@ pub struct SearchEverywhereDelegate {
     /// `workspace/symbol` task resolves; merged with phase 1 to
     /// produce the final match list.
     symbol_hits: Vec<(u8, f64, Hit)>,
+    /// Phase-3 hits (Smart Mode persistent symbol cache). Same
+    /// priority bucket as live LSP symbols (bucket 0) but with
+    /// a lower score baseline so live results win when both
+    /// match. Populated even when LSPs are off.
+    cached_hits: Vec<(u8, f64, Hit)>,
     selected_ix: usize,
     previous_focus: FocusHandle,
     cancel_flag: Arc<AtomicBool>,
@@ -387,14 +406,36 @@ impl SearchEverywhereDelegate {
     /// picker renders. Sorts by priority bucket then descending
     /// score and caps at 100 visible rows.
     fn recompute_matches(&mut self) {
-        let mut combined: Vec<(u8, f64, Hit)> =
-            Vec::with_capacity(self.symbol_hits.len() + self.phase1_hits.len());
+        let mut combined: Vec<(u8, f64, Hit)> = Vec::with_capacity(
+            self.symbol_hits.len() + self.cached_hits.len() + self.phase1_hits.len(),
+        );
         combined.extend(self.symbol_hits.iter().cloned());
+        combined.extend(self.cached_hits.iter().cloned());
         combined.extend(self.phase1_hits.iter().cloned());
+
+        // Dedupe live LSP symbols vs cache hits with the same
+        // (name, file, range_start_row): live wins. Stable sort
+        // keeps relative order so the dedupe pass picks the
+        // first (live) occurrence.
         combined.sort_by(|a, b| {
             a.0.cmp(&b.0)
                 .then(b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal))
         });
+        let mut seen: collections::HashSet<(String, String, u32)> = collections::HashSet::default();
+        combined.retain(|(_, _, hit)| match hit {
+            Hit::Symbol { symbol, .. } => seen.insert((
+                symbol.name.clone(),
+                symbol_path_label(symbol),
+                symbol.range.start.0.row,
+            )),
+            Hit::CachedSymbol { symbol, .. } => seen.insert((
+                symbol.name.clone(),
+                symbol.rel_path.clone(),
+                symbol.range_start_row,
+            )),
+            _ => true,
+        });
+
         self.matches = combined.into_iter().take(100).map(|(_, _, h)| h).collect();
         if self.selected_ix >= self.matches.len() {
             self.selected_ix = 0;
@@ -477,6 +518,18 @@ impl PickerDelegate for SearchEverywhereDelegate {
             .read(cx)
             .visible_worktrees_and_single_files(cx)
             .map(|worktree| worktree.read(cx).snapshot())
+            .collect();
+
+        // claude-review-v2 fork — Smart Mode cache: visible
+        // worktree abs-paths key the persistent symbol index by
+        // repo. Snapshot here so phase 3 (cache) doesn't need
+        // to re-borrow the project on the executor.
+        let cache_repo_paths: Vec<PathBuf> = project
+            .read(cx)
+            .worktree_store()
+            .read(cx)
+            .visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
             .collect();
         let file_sets: Vec<PathMatchCandidateSet> = worktree_snapshots
             .iter()
@@ -618,6 +671,7 @@ impl PickerDelegate for SearchEverywhereDelegate {
                     }
                     picker.delegate.phase1_hits = phase1;
                     picker.delegate.symbol_hits.clear();
+                    picker.delegate.cached_hits.clear();
                     picker.delegate.recompute_matches();
                     cx.notify();
                 })
@@ -724,6 +778,77 @@ impl PickerDelegate for SearchEverywhereDelegate {
                     cx.notify();
                 })
                 .ok();
+
+            // Phase 3: Smart Mode persistent symbol cache.
+            // Reads from `ProjectIndexDB` (SQLite + FTS5)
+            // populated by the project_index collector while
+            // LSPs were running in prior or current sessions.
+            // Always queried, even when LSPs are off — this
+            // is the whole point of the cache.
+            if !cache_repo_paths.is_empty() {
+                let pattern = fts_prefix_query(&query);
+                let db = cx.update(|cx| ProjectIndexDB::global(cx));
+                let cached_symbols: Vec<CachedSymbol> = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut out = Vec::new();
+                        for repo in &cache_repo_paths {
+                            let repo_str = repo.to_string_lossy().to_string();
+                            match db.search_fts(&repo_str, &pattern, 200) {
+                                Ok(rows) => out.extend(rows),
+                                Err(err) => log::debug!(
+                                    "search_everywhere: cache query failed for {}: {err:#}",
+                                    repo.display()
+                                ),
+                            }
+                        }
+                        out
+                    })
+                    .await;
+
+                if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+
+                let mut cached_hits: Vec<(u8, f64, Hit)> =
+                    Vec::with_capacity(cached_symbols.len());
+                for symbol in cached_symbols {
+                    let lowered_name = symbol.name.to_lowercase();
+                    // Score: same shape as live LSP symbols
+                    // (substring + prefix boost) but offset
+                    // lower by `-1.0` so a live result with
+                    // identical name still ranks first when
+                    // both are present.
+                    let mut score = -1.0_f64;
+                    if lowered_name.starts_with(&lowered_query) {
+                        score += 5000.0;
+                    } else if lowered_name.contains(&lowered_query) {
+                        score += 2000.0;
+                    } else {
+                        score += 100.0;
+                    }
+                    let name_positions = match_positions_within(&symbol.name, &query);
+                    cached_hits.push((
+                        0,
+                        score,
+                        Hit::CachedSymbol {
+                            symbol,
+                            name_positions,
+                        },
+                    ));
+                }
+
+                picker
+                    .update(cx, |picker, cx| {
+                        if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                            return;
+                        }
+                        picker.delegate.cached_hits = cached_hits;
+                        picker.delegate.recompute_matches();
+                        cx.notify();
+                    })
+                    .ok();
+            }
         })
     }
 
@@ -733,6 +858,38 @@ impl PickerDelegate for SearchEverywhereDelegate {
             return;
         };
         match hit {
+            Hit::CachedSymbol { symbol, .. } => {
+                // Cache hit: open the file at the recorded
+                // path + range. No `Project::open_buffer_for_symbol`
+                // because the cache row isn't tied to a live
+                // language server entity.
+                let workspace = self.workspace.clone();
+                let abs_path = PathBuf::from(&symbol.repo_path).join(&symbol.rel_path);
+                let row = symbol.range_start_row;
+                let col = symbol.range_start_col;
+                cx.spawn_in(window, async move |_, cx| {
+                    workspace
+                        .update_in(cx, |workspace, window, cx| {
+                            workspace.open_abs_path(
+                                abs_path,
+                                workspace::OpenOptions {
+                                    visible: Some(workspace::OpenVisible::All),
+                                    ..Default::default()
+                                },
+                                window,
+                                cx,
+                            )
+                        })?
+                        .await
+                        .ok();
+                    let _ = (row, col);
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+                self.modal
+                    .update(cx, |_, cx| cx.emit(DismissEvent))
+                    .ok();
+            }
             Hit::Symbol { symbol, .. } => {
                 let buffer = self
                     .project
@@ -838,6 +995,16 @@ impl PickerDelegate for SearchEverywhereDelegate {
                 // leading prefix so those offsets stay valid.
                 (label, name_positions.clone(), "SYM")
             }
+            Hit::CachedSymbol {
+                symbol,
+                name_positions,
+            } => {
+                let label = format!("{}  ·  {}", symbol.name, symbol.rel_path);
+                // Distinct badge so users see which results
+                // came from the persistent cache vs a live
+                // language server.
+                (label, name_positions.clone(), "CACHE")
+            }
             Hit::Action { entry, positions } => {
                 (entry.display.clone(), positions.clone(), "ACT")
             }
@@ -917,6 +1084,22 @@ fn collect_actions(window: &mut Window, cx: &App) -> Vec<ActionEntry> {
     out.sort_by(|a, b| a.display.cmp(&b.display));
     out.dedup_by(|a, b| a.name == b.name);
     out
+}
+
+/// Best-effort byte-position list for highlighting `query`
+/// occurrences inside `name`. Cheap substring scan — no fuzzy
+/// heuristics. Empty if `query` doesn't appear; we don't want
+/// HighlightedLabel to pull on positions that don't exist.
+fn match_positions_within(name: &str, query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let lowered_name = name.to_lowercase();
+    let lowered_query = query.to_lowercase();
+    let Some(start) = lowered_name.find(&lowered_query) else {
+        return Vec::new();
+    };
+    (start..start + query.len()).collect()
 }
 
 fn symbol_path_label(symbol: &Symbol) -> String {

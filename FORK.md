@@ -559,3 +559,64 @@ Implementation:
 - `crates/project/src/manifest_tree/server_tree.rs` — spawn gate.
 - `crates/project/src/lsp_store.rs` — `SessionLspOverrides` global, `lsp_auto_start_allowed` helper, `enable_*_for_session` mutators, re-registration plumbing.
 - `crates/language_tools/src/lsp_button.rs` — popover Smart Mode section, `.lsp.json` discovery, gated-adapter listing, always-render pill.
+
+# Project Index — Persistent Symbol Cache
+
+Smart Mode (above) lets the user run a workspace without language servers. The downside is every navigation feature that depends on the LSP — Search Everywhere symbol matches, go-to-definition for cross-file declarations — becomes a no-op.
+
+This crate (`project_index`) bridges that gap. While LSPs ARE running, a background sweep periodically calls `Project::symbols("")` and writes the resulting workspace symbols into a SQLite database. When LSPs are off (Smart Mode disabled), Search Everywhere falls back to the cached corpus so the user still has navigable class / function / type names without paying the LSP startup cost.
+
+The cache is **never the source of truth**. Live LSP results always rank above cache hits when both fire. The cache is a UX bridge for the read-only browsing case, not a replacement for semantic resolution.
+
+## What's stored
+
+A SQLite domain (`ProjectIndexDB`) sharing Zed's existing `<data_dir>/db/<channel>/db.sqlite`. Two tables:
+
+- `pi_files(id, repo_path, rel_path, last_seen)` — invalidation metadata, scoped per repo so multiple projects coexist.
+- `pi_symbols(id, file_id, name, kind, container, range_*, server_name)` — one row per symbol declaration.
+
+Plus an FTS5 virtual table `pi_symbols_fts(name, container)` driven by triggers, for sub-millisecond fuzzy lookup.
+
+`server_name` lets multiple language servers contribute to the same project without trampling each other — re-recording one server's view leaves rows from other servers intact.
+
+## How rows get in
+
+`crates/project_index/src/collector.rs` runs a per-project background loop:
+
+1. Wait `STARTUP_GRACE_PERIOD` (45 s) so we don't pile work on Zed boot.
+2. Every `IDLE_REFRESH_INTERVAL` (5 min): if any LSP is running for the project, call `Project::symbols("")` (the documented LSP "all symbols" sweep), filter to `SymbolLocation::InProject`, group by `(worktree, file, server_name)`, and atomically replace each group via `replace_file_symbols`.
+3. Bail out fast when no LSPs are running — Smart Mode off → nothing to feed → no work.
+
+Errors (LSP timeouts, DB write failures) are logged and skipped. The cache is fail-soft.
+
+## How rows get out
+
+Search Everywhere (`shift shift`) gained a phase 3 after its existing LSP `workspace/symbol` query. It calls `ProjectIndexDB::search_fts(repo_path, fts_prefix_query(query), 200)` against every visible worktree's abs-path and merges the results into the popover's match list with a distinct **CACHE** badge. Cache hits sit at the same priority bucket as live LSP symbols (bucket 0) but with a `-1.0` score offset, so a live result with the same name always ranks first when both are present. Recompute dedupes on `(name, file, range_start_row)` so the user doesn't see two identical rows.
+
+Confirm on a cache row opens the file at the recorded path. (Range jumping inside the opened buffer is a v2 concern.)
+
+## Eviction
+
+On Zed startup, `evict_older_than(cutoff)` drops every `pi_files` row whose `last_seen` is older than 30 days. CASCADE on the foreign key takes care of dependent `pi_symbols` rows. The schema's `last_seen` column is bumped on every successful sweep, so an active project's rows never expire.
+
+Manual cleanup: `ProjectIndexDB::clear_repo(path)` wipes a single project. (Not yet wired to a UI command — invoke from a debugger or test harness as needed.)
+
+## Why SQLite + FTS5 vs Tantivy / redb
+
+Tantivy would be objectively faster for the FTS workload — Lucene-style inverted indexes are purpose-built for this. But Zed already depends on `libsqlite3-sys` and ships migration / domain plumbing via the `db` crate. The marginal speedup wasn't worth a new dep, an extra index format on disk, and a parallel migration story. SQLite FTS5 handles 100k+ symbols with sub-millisecond fuzzy queries; that's already faster than the LSP it's bridging away from.
+
+If the corpus ever outgrows SQLite (millions of symbols across hundreds of repos), porting the FTS layer to Tantivy is straightforward — the `search_fts` API is the only public read surface and could swap implementations.
+
+## Limits
+
+- `workspace/symbol("")` semantics vary per LSP. Some return everything; some return nothing on empty query; kotlin-lsp returns up to 10k matched symbols only when the query is non-empty. We use the empty-query form because it's the documented "give me all" semantic; servers that don't honor it just won't contribute to the cache. v2 could supplement with periodic per-file `documentSymbol` sweeps over open buffers.
+- Range jumping for cache hits isn't wired through the editor yet. Confirm just opens the file. Live LSP hits still jump to the exact range.
+- No go-to-definition fallback in v1. The infrastructure (lookup-by-name) is in place; hooking into `LspStore::definitions` is a follow-up.
+- Cache rows include the LSP `server_name` they came from. If you uninstall an extension, its rows linger until eviction. Acceptable trade-off for now; a manual "clear cache" UI command is straightforward to add.
+
+Implementation:
+- `crates/project_index/src/project_index.rs` — `ProjectIndexDB` domain, schema migrations, `CachedSymbol` + `CachedSymbolKind`, public `replace_file_symbols` / `lookup_exact` / `search_fts` / `count_symbols` / `evict_older_than` / `clear_repo` API. Unit tests cover round-trip, per-server scoping, FTS prefix search, repo scoping.
+- `crates/project_index/src/collector.rs` — per-project background sweep loop. Idle-aware (skips when no LSP running), error-soft.
+- `crates/project_index/src/project_index.rs::init` — startup eviction sweep + per-workspace collector spawn.
+- `crates/zed/src/main.rs` — calls `project_index::init(cx)` from the app boot path.
+- `crates/search_everywhere/src/search_everywhere.rs` — phase-3 cache query in `update_matches`, new `Hit::CachedSymbol` variant, dedupe vs live LSP, **CACHE** badge in `render_match`.

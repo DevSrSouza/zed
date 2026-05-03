@@ -13546,6 +13546,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "project_index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "db",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "project",
+ "util",
+ "workspace",
+ "worktree",
+]
+
+[[package]]
 name = "project_panel"
 version = "0.1.0"
 dependencies = [
@@ -15783,6 +15800,7 @@ name = "search_everywhere"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "collections",
  "editor",
  "futures 0.3.32",
  "fuzzy_nucleo",
@@ -15790,6 +15808,7 @@ dependencies = [
  "log",
  "picker",
  "project",
+ "project_index",
  "ui",
  "util",
  "workspace",
@@ -22509,6 +22528,7 @@ dependencies = [
  "pretty_assertions",
  "profiling",
  "project",
+ "project_index",
  "project_panel",
  "project_symbols",
  "prompt_store",
