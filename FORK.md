@@ -109,9 +109,27 @@ This does **not** unlock any new authenticated GitHub features — it only remov
 
 # Search Everywhere (`shift shift`)
 
-Inspired by IntelliJ IDEs' Search Everywhere. Unified fuzzy picker — files + actions in one modal. Bound in JetBrains keymap.
+Inspired by IntelliJ IDEs' Search Everywhere. Unified fuzzy picker — **LSP workspace symbols + files + actions** in one modal. Bound in JetBrains keymap.
 
-Use: press `shift shift`. Type. Filename-substring match wins for files; exact-prefix match wins for actions. ENTER opens / dispatches. ESC closes. Hover any row for full-path tooltip. Toggle "Include .gitignored files" at bottom. Last query restored on reopen; active editor's selection prefills on open.
+Use: press `shift shift`. Type. ENTER opens the file / jumps to symbol / dispatches the action. ESC closes. Hover any row for full-path tooltip. Toggle "Include .gitignored files" at bottom. Last query restored on reopen; active editor's selection prefills on open.
+
+Sort order (priority bucket — lower wins, ties broken by descending fuzzy score):
+
+0. **LSP workspace symbols** — pulled from `Project::symbols(query)`, which fans out to every running language server's `workspace/symbol` handler. Filtered to `SymbolLocation::InProject` so dependency sources (Xcode `SourcePackages/checkouts`, `~/.gradle/caches`, sourcekit-lsp generated interfaces) don't pollute results. Re-ranked client-side with `fuzzy_nucleo` so subsequence matches surface — typing `launchSubscriber` finds `launchSubscriberAwareMolecule`. Exact-prefix and substring matches get progressively bigger boosts.
+1. **Action exact-prefix** — when the action's humanized name starts with the query (mirrors IntelliJ's "type what the action does").
+2. **Files** — path-aware fuzzy via `match_path_sets` with a filename-substring boost on top: a `.kt` whose basename starts with / contains the query promotes ahead of deep paths whose components incidentally match.
+3. **Directories and remaining actions**.
+
+## Performance shape
+
+LSP symbol queries are expensive — `workspace/symbol` fans out to every running server (kotlin-lsp, sourcekit-lsp, …) and a single-character query can return thousands of partial hits. The picker is structured to keep the UI snappy:
+
+- **Two-phase update.** Phase 1 (files / dirs / actions, all local) publishes immediately so the picker has results to show within ~10 ms. Phase 2 (LSP `workspace/symbol`) awaits separately and merges its results in when ready, without blocking phase 1.
+- **Length gate.** LSP queries fire only when the typed query is ≥ 2 characters. Single-char queries are too broad and would dump the entire symbol DB on every keystroke.
+- **Cancel-on-keystroke.** Each new keystroke replaces the in-flight task; the dropped task auto-cancels, and a `cancel_flag` check at every publish point drops stale results before they render.
+- **Server-side cancellation.** The LSP task drops when superseded — Zed stops polling, and the server's pending `workspace/symbol` request is abandoned client-side. The server may still finish processing it, but no time is spent on the response.
+
+Net effect: the picker feels instantaneous on typed queries even when kotlin-lsp is mid-indexing, and stops sending traffic to the LSP the moment the user types another character.
 
 # Auto-run `cmd+shift+F` from Selection
 

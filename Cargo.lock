@@ -15783,9 +15783,11 @@ name = "search_everywhere"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "editor",
  "futures 0.3.32",
  "fuzzy_nucleo",
  "gpui",
+ "log",
  "picker",
  "project",
  "ui",

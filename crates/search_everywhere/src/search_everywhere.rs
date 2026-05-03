@@ -1,28 +1,35 @@
 //! Search Everywhere — IntelliJ-style unified picker.
 //!
-//! Combines worktree files and registered actions in a single
-//! fuzzy-matched modal. Bound to `shift shift` in the JetBrains
-//! keymap (replacing the plain `command_palette::Toggle`).
+//! Combines LSP workspace symbols, worktree files, directories, and
+//! registered actions in a single fuzzy-matched modal. Bound to
+//! `shift shift` in the JetBrains keymap (replacing the plain
+//! `command_palette::Toggle`).
 //!
-//! Files are matched via `fuzzy_nucleo::match_path_sets`
-//! (path-aware scoring, files-only — same primitive the file
-//! finder uses), so leaf-name matches outrank deep-path matches.
-//! Actions are matched in parallel with `match_strings_async`.
+//! - LSP symbols come from `Project::symbols(query)`, which fans the
+//!   query out to every running language server's `workspace/symbol`
+//!   handler. Names are post-fuzzed against the query so a class
+//!   that exact-prefix matches the query ranks above ones whose
+//!   names just contain the query.
+//! - Files are matched via `fuzzy_nucleo::match_path_sets`
+//!   (path-aware scoring, files-only — same primitive the file
+//!   finder uses).
+//! - Actions are matched in parallel with `match_strings_async`.
 //!
-//! Sort order:
+//! Sort order (priority bucket — lower wins, ties broken by score):
+//!   0. LSP workspace symbols.
 //!   1. Action whose humanized name has an exact case-insensitive
-//!      prefix match against the query — highest signal, mirrors
-//!      IntelliJ.
-//!   2. Files (already path-scored) ahead of remaining actions.
-//!   3. Within ties, higher fuzzy score wins.
+//!      prefix match against the query — highest IntelliJ signal.
+//!   2. Files (path-scored, with filename-substring boost).
+//!   3. Directories and remaining actions.
 
+use editor::{Bias, Editor, SelectionEffects, scroll::Autoscroll};
 use fuzzy_nucleo::{PathMatch, StringMatch, StringMatchCandidate};
 use gpui::{
     Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Global,
     ParentElement, Render, Styled, Subscription, Task, WeakEntity, Window, actions, rems,
 };
 use picker::{Picker, PickerDelegate};
-use project::{Candidates, PathMatchCandidateSet, ProjectPath};
+use project::{Candidates, PathMatchCandidateSet, ProjectPath, Symbol};
 use std::cmp::Ordering;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -106,6 +113,8 @@ impl SearchEverywhereModal {
             project: project.clone(),
             actions,
             matches: Vec::new(),
+            phase1_hits: Vec::new(),
+            symbol_hits: Vec::new(),
             selected_ix: 0,
             previous_focus,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -180,6 +189,14 @@ impl SearchEverywhereModal {
             .iter()
             .take(5)
             .map(|hit| match hit {
+                Hit::Symbol { symbol, .. } => {
+                    let path = symbol_path_label(symbol);
+                    if path.is_empty() {
+                        symbol.name.chars().count()
+                    } else {
+                        symbol.name.chars().count() + 5 + path.chars().count()
+                    }
+                }
                 Hit::Action { entry, .. } => entry.display.chars().count(),
                 Hit::File { path_match } => compose_path_label(path_match).chars().count(),
             })
@@ -329,6 +346,10 @@ impl Clone for ActionEntry {
 
 #[derive(Clone)]
 enum Hit {
+    Symbol {
+        symbol: Symbol,
+        name_positions: Vec<usize>,
+    },
     Action {
         entry: ActionEntry,
         positions: Vec<usize>,
@@ -343,12 +364,42 @@ pub struct SearchEverywhereDelegate {
     project: Entity<project::Project>,
     actions: Vec<ActionEntry>,
     matches: Vec<Hit>,
+    /// Phase-1 hits (files, dirs, actions). Updated immediately
+    /// once the local fuzzy match completes, before the LSP
+    /// `workspace/symbol` round-trip finishes — so the picker has
+    /// something to show while the LSP is still thinking.
+    phase1_hits: Vec<(u8, f64, Hit)>,
+    /// Phase-2 hits (LSP workspace symbols). Updated when the
+    /// `workspace/symbol` task resolves; merged with phase 1 to
+    /// produce the final match list.
+    symbol_hits: Vec<(u8, f64, Hit)>,
     selected_ix: usize,
     previous_focus: FocusHandle,
     cancel_flag: Arc<AtomicBool>,
     include_ignored: bool,
     last_query: String,
     modal: WeakEntity<SearchEverywhereModal>,
+}
+
+impl SearchEverywhereDelegate {
+    /// Recombine phase-1 (files / dirs / actions) and phase-2 (LSP
+    /// symbols) hit lists into the final `matches` slice the
+    /// picker renders. Sorts by priority bucket then descending
+    /// score and caps at 100 visible rows.
+    fn recompute_matches(&mut self) {
+        let mut combined: Vec<(u8, f64, Hit)> =
+            Vec::with_capacity(self.symbol_hits.len() + self.phase1_hits.len());
+        combined.extend(self.symbol_hits.iter().cloned());
+        combined.extend(self.phase1_hits.iter().cloned());
+        combined.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal))
+        });
+        self.matches = combined.into_iter().take(100).map(|(_, _, h)| h).collect();
+        if self.selected_ix >= self.matches.len() {
+            self.selected_ix = 0;
+        }
+    }
 }
 
 impl PickerDelegate for SearchEverywhereDelegate {
@@ -386,14 +437,19 @@ impl PickerDelegate for SearchEverywhereDelegate {
         self.last_query = query.clone();
         if query.is_empty() {
             self.matches.clear();
+            self.phase1_hits.clear();
+            self.symbol_hits.clear();
             self.selected_ix = 0;
             cx.notify();
             return Task::ready(());
         }
 
         // Cancel any in-flight path search and start a fresh flag for
-        // this round; `match_path_sets` polls this to bail out
-        // gracefully when the query changes.
+        // this round. Reused for two purposes:
+        //  - `match_path_sets` polls it to bail out mid-scan,
+        //  - phase 2 (LSP symbol merge) checks it before publishing
+        //    its result, so a stale `workspace/symbol` response that
+        //    arrived after the user typed more chars is dropped.
         self.cancel_flag
             .store(true, std::sync::atomic::Ordering::Release);
         self.cancel_flag = Arc::new(AtomicBool::new(false));
@@ -403,6 +459,18 @@ impl PickerDelegate for SearchEverywhereDelegate {
         let executor = cx.background_executor().clone();
         let project = self.project.clone();
         let include_ignored = self.include_ignored;
+
+        // Gate the LSP `workspace/symbol` round-trip on a minimum
+        // query length. Single-character queries blow up to
+        // thousands of matches in some servers (kotlin-lsp returns
+        // every symbol containing that letter) and we don't want
+        // to send that traffic on every keystroke.
+        let symbols_task = if query.chars().count() >= 2 {
+            Some(project.update(cx, |project, cx| project.symbols(&query, cx)))
+        } else {
+            None
+        };
+
         let worktree_snapshots: Vec<_> = project
             .read(cx)
             .worktree_store()
@@ -484,11 +552,19 @@ impl PickerDelegate for SearchEverywhereDelegate {
                 .await
             };
 
+            // Phase 1: local fuzzy match (files, dirs, actions).
+            // These are cheap and don't go off-process. We publish
+            // them as soon as they're ready so the picker has
+            // something to show even if `workspace/symbol` is slow.
             let (action_matches, file_matches, dir_matches) =
                 futures::join!(actions_task, files_task, dirs_task);
 
+            if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+
             let lowered_query = query.to_lowercase();
-            let mut hits: Vec<(u8, f64, Hit)> = Vec::new();
+            let mut phase1: Vec<(u8, f64, Hit)> = Vec::new();
             for m in action_matches {
                 let StringMatch {
                     candidate_id,
@@ -499,13 +575,13 @@ impl PickerDelegate for SearchEverywhereDelegate {
                 let entry = actions[candidate_id].clone();
                 let exact_prefix = entry.display.to_lowercase().starts_with(&lowered_query);
                 // priority bucket — lower wins:
-                //   0: action exact-prefix
-                //   1: file
-                //   2: other action
-                let priority: u8 = if exact_prefix { 0 } else { 2 };
-                hits.push((priority, score, Hit::Action { entry, positions }));
+                //   0: LSP symbol           (filled in phase 2)
+                //   1: action exact-prefix
+                //   2: file (substring boost)
+                //   3: directory / other action
+                let priority: u8 = if exact_prefix { 1 } else { 3 };
+                phase1.push((priority, score, Hit::Action { entry, positions }));
             }
-            let lowered = query.to_lowercase();
             for path_match in file_matches {
                 // Boost: when the filename (last path segment)
                 // contains the query as a contiguous substring,
@@ -524,32 +600,127 @@ impl PickerDelegate for SearchEverywhereDelegate {
                     .unwrap_or("")
                     .to_lowercase();
                 let mut score = path_match.score;
-                if filename.starts_with(&lowered) {
+                if filename.starts_with(&lowered_query) {
                     score += 2000.0;
-                } else if filename.contains(&lowered) {
+                } else if filename.contains(&lowered_query) {
                     score += 1000.0;
                 }
-                hits.push((1, score, Hit::File { path_match }));
+                phase1.push((2, score, Hit::File { path_match }));
             }
             for path_match in dir_matches {
-                let score = path_match.score;
-                // Directories rank below remaining actions/files
-                // (priority 3) so files always lead but folders
-                // still surface when the query targets one.
-                hits.push((3, score, Hit::File { path_match }));
+                phase1.push((3, path_match.score, Hit::File { path_match }));
             }
-            hits.sort_by(|a, b| {
-                a.0.cmp(&b.0)
-                    .then(b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal))
-            });
-            let merged: Vec<Hit> = hits.into_iter().take(100).map(|(_, _, h)| h).collect();
 
             picker
                 .update(cx, |picker, cx| {
-                    picker.delegate.matches = merged;
-                    if picker.delegate.selected_ix >= picker.delegate.matches.len() {
-                        picker.delegate.selected_ix = 0;
+                    if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
                     }
+                    picker.delegate.phase1_hits = phase1;
+                    picker.delegate.symbol_hits.clear();
+                    picker.delegate.recompute_matches();
+                    cx.notify();
+                })
+                .ok();
+
+            // Phase 2: LSP `workspace/symbol`. Awaited separately so
+            // a slow language server doesn't block phase-1 results.
+            // The captured `symbols_task` is automatically cancelled
+            // when this whole future is dropped (which happens as
+            // soon as the user types a new character, replacing the
+            // outer `update_matches` task).
+            let Some(symbols_task) = symbols_task else {
+                return;
+            };
+            let symbols = match symbols_task.await {
+                Ok(s) => s,
+                Err(err) => {
+                    log::debug!("search_everywhere: workspace/symbol failed: {err:#}");
+                    return;
+                }
+            };
+            if cancel_flag.load(std::sync::atomic::Ordering::Acquire) || symbols.is_empty() {
+                return;
+            }
+
+            // Drop symbols that originate outside the project's
+            // worktrees — dependency sources (Xcode SourcePackages
+            // checkouts, ~/.gradle caches, sourcekit-lsp's
+            // generated interfaces) flood the picker with noise
+            // when the user just wants their own code. Keep only
+            // `SymbolLocation::InProject(_)` results.
+            let symbols: Vec<Symbol> = symbols
+                .into_iter()
+                .filter(|s| {
+                    matches!(
+                        s.path,
+                        project::lsp_store::SymbolLocation::InProject(_)
+                    )
+                })
+                .collect();
+            if symbols.is_empty() {
+                return;
+            }
+
+            // Re-rank server-supplied symbols by fuzzy-matching
+            // their `name` against the query. Servers vary widely
+            // — kotlin-lsp returns hundreds of partial hits in no
+            // particular order; sourcekit-lsp returns nothing at
+            // all. fuzzy_nucleo's substring/subsequence match is
+            // what we want here so e.g. `launchSubscriber` still
+            // surfaces `launchSubscriberAwareMolecule`.
+            let symbol_candidates: Vec<StringMatchCandidate> = symbols
+                .iter()
+                .enumerate()
+                .map(|(i, s)| StringMatchCandidate::new(i, &s.name))
+                .collect();
+            let symbol_matches = fuzzy_nucleo::match_strings_async(
+                &symbol_candidates,
+                &query,
+                fuzzy_nucleo::Case::Smart,
+                fuzzy_nucleo::LengthPenalty::On,
+                200,
+                &Default::default(),
+                executor.clone(),
+            )
+            .await;
+            if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+
+            let mut symbol_hits: Vec<(u8, f64, Hit)> = Vec::with_capacity(symbol_matches.len());
+            for m in symbol_matches {
+                let StringMatch {
+                    candidate_id,
+                    score,
+                    positions,
+                    ..
+                } = m;
+                let symbol = symbols[candidate_id].clone();
+                let lowered_name = symbol.name.to_lowercase();
+                let mut adjusted = score;
+                if lowered_name.starts_with(&lowered_query) {
+                    adjusted += 5000.0;
+                } else if lowered_name.contains(&lowered_query) {
+                    adjusted += 2000.0;
+                }
+                symbol_hits.push((
+                    0,
+                    adjusted,
+                    Hit::Symbol {
+                        symbol,
+                        name_positions: positions,
+                    },
+                ));
+            }
+
+            picker
+                .update(cx, |picker, cx| {
+                    if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    picker.delegate.symbol_hits = symbol_hits;
+                    picker.delegate.recompute_matches();
                     cx.notify();
                 })
                 .ok();
@@ -562,6 +733,47 @@ impl PickerDelegate for SearchEverywhereDelegate {
             return;
         };
         match hit {
+            Hit::Symbol { symbol, .. } => {
+                let buffer = self
+                    .project
+                    .update(cx, |project, cx| project.open_buffer_for_symbol(&symbol, cx));
+                let workspace = self.workspace.clone();
+                cx.spawn_in(window, async move |_, cx| {
+                    let buffer = buffer.await?;
+                    workspace.update_in(cx, |workspace, window, cx| {
+                        let position = buffer
+                            .read(cx)
+                            .clip_point_utf16(symbol.range.start, Bias::Left);
+                        let pane = workspace.active_pane().clone();
+                        let editor = workspace.open_project_item::<Editor>(
+                            pane, buffer, true, true, true, true, window, cx,
+                        );
+                        editor.update(cx, |editor, cx| {
+                            let multibuffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+                            let Some(buffer_snapshot) = multibuffer_snapshot.as_singleton() else {
+                                return;
+                            };
+                            let text_anchor = buffer_snapshot.anchor_before(position);
+                            let Some(anchor) =
+                                multibuffer_snapshot.anchor_in_buffer(text_anchor)
+                            else {
+                                return;
+                            };
+                            editor.change_selections(
+                                SelectionEffects::scroll(Autoscroll::center()),
+                                window,
+                                cx,
+                                |s| s.select_ranges([anchor..anchor]),
+                            );
+                        });
+                    })?;
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+                self.modal
+                    .update(cx, |_, cx| cx.emit(DismissEvent))
+                    .ok();
+            }
             Hit::Action { entry, .. } => {
                 let action = entry.action.boxed_clone();
                 self.previous_focus.focus(window, cx);
@@ -611,6 +823,21 @@ impl PickerDelegate for SearchEverywhereDelegate {
     ) -> Option<Self::ListItem> {
         let hit = self.matches.get(ix)?;
         let (label_text, positions, badge) = match hit {
+            Hit::Symbol {
+                symbol,
+                name_positions,
+            } => {
+                let path_segment = symbol_path_label(symbol);
+                let label = if path_segment.is_empty() {
+                    symbol.name.clone()
+                } else {
+                    format!("{}  ·  {}", symbol.name, path_segment)
+                };
+                // `name_positions` are byte offsets into `symbol.name`.
+                // The composed label keeps `symbol.name` as the
+                // leading prefix so those offsets stay valid.
+                (label, name_positions.clone(), "SYM")
+            }
             Hit::Action { entry, positions } => {
                 (entry.display.clone(), positions.clone(), "ACT")
             }
@@ -690,6 +917,14 @@ fn collect_actions(window: &mut Window, cx: &App) -> Vec<ActionEntry> {
     out.sort_by(|a, b| a.display.cmp(&b.display));
     out.dedup_by(|a, b| a.name == b.name);
     out
+}
+
+fn symbol_path_label(symbol: &Symbol) -> String {
+    use project::lsp_store::SymbolLocation;
+    match &symbol.path {
+        SymbolLocation::InProject(path) => path.path.as_unix_str().to_string(),
+        SymbolLocation::OutsideProject { abs_path, .. } => abs_path.display().to_string(),
+    }
 }
 
 fn compose_path_label(path_match: &PathMatch) -> String {
