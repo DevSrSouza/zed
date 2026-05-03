@@ -1100,6 +1100,15 @@ pub struct StoredReviewComment {
     pub created_at: Instant,
     /// Whether this comment is currently being edited inline.
     pub is_editing: bool,
+    /// Display name of the author when the comment is sourced from a remote
+    /// system (e.g. a GitHub PR review comment). `None` means the comment
+    /// belongs to the current local user.
+    pub author: Option<SharedString>,
+    /// Avatar URL for the author when the comment is from a remote source.
+    pub avatar_url: Option<SharedUri>,
+    /// Whether this comment came from outside the local review session and
+    /// should be treated as read-only (no inline edit / delete UI).
+    pub is_remote: bool,
 }
 
 impl StoredReviewComment {
@@ -1110,6 +1119,31 @@ impl StoredReviewComment {
             range: anchor_range,
             created_at: Instant::now(),
             is_editing: false,
+            author: None,
+            avatar_url: None,
+            is_remote: false,
+        }
+    }
+
+    /// Constructs a comment sourced from a remote system (e.g. GitHub PR
+    /// review comment). The author and avatar are rendered alongside the
+    /// body, and the comment is marked as read-only.
+    pub fn remote(
+        id: usize,
+        comment: String,
+        anchor_range: Range<Anchor>,
+        author: SharedString,
+        avatar_url: Option<SharedUri>,
+    ) -> Self {
+        Self {
+            id,
+            comment,
+            range: anchor_range,
+            created_at: Instant::now(),
+            is_editing: false,
+            author: Some(author),
+            avatar_url,
+            is_remote: true,
         }
     }
 }
@@ -4739,7 +4773,11 @@ impl Editor {
             dismissed = true;
         }
         if !self.diff_review_overlays.is_empty() {
-            self.dismiss_all_diff_review_overlays(cx);
+            // Only drop overlays that have no stored comments — i.e. the
+            // freshly-opened "+ but never typed" composer. Overlays with
+            // existing threads (locally stored or PR-injected remote ones)
+            // stay visible so ESC doesn't blow them away.
+            self.dismiss_overlays_without_comments(cx);
             dismissed = true;
         }
 
@@ -22612,8 +22650,25 @@ impl Editor {
         if comment_count == 0 {
             base_height
         } else if comments_expanded {
-            // Header (1 line) + 2 lines per comment
-            base_height + 1 + (comment_count as u32 * 2)
+            // Sum each comment's body line count (clamped) so long, possibly
+            // multi-paragraph comments — like GitHub PR review threads — get
+            // enough vertical space without clipping. `+2` per comment covers
+            // the author header + padding.
+            let comments = self.comments_for_hunk(hunk_key, snapshot);
+            let body_rows: u32 = comments
+                .iter()
+                .map(|c| {
+                    let lines = c.comment.lines().count() as u32;
+                    let wrapped_estimate =
+                        (c.comment.len() as u32 / 80).saturating_add(if c.comment.is_empty() {
+                            0
+                        } else {
+                            1
+                        });
+                    lines.max(wrapped_estimate).clamp(1, 30) + 2
+                })
+                .sum();
+            base_height + 1 + body_rows
         } else {
             // Just header when collapsed
             base_height + 1
@@ -23019,10 +23074,76 @@ impl Editor {
         anchor_range: Range<Anchor>,
         cx: &mut Context<Self>,
     ) -> usize {
+        self.add_review_comment_inner(
+            hunk_key,
+            StoredReviewComment::new(0, comment, anchor_range),
+            cx,
+        )
+    }
+
+    /// Adds a remote-sourced review comment (e.g. an existing GitHub PR
+    /// comment) so it renders in the same inline-overlay UI as locally
+    /// authored comments. Marked read-only and attributed to the supplied
+    /// author/avatar.
+    pub fn add_remote_review_comment(
+        &mut self,
+        hunk_key: DiffHunkKey,
+        comment: String,
+        anchor_range: Range<Anchor>,
+        author: SharedString,
+        avatar_url: Option<SharedUri>,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        self.add_review_comment_inner(
+            hunk_key,
+            StoredReviewComment::remote(0, comment, anchor_range, author, avatar_url),
+            cx,
+        )
+    }
+
+    /// Combined helper: opens (or focuses) the diff-review overlay for the
+    /// given display row range and stores `comment` against the same hunk
+    /// key the overlay computes internally. Use this from PR-style flows
+    /// where a remote comment must show up inside the overlay; calling
+    /// `show_diff_review_overlay` and `add_remote_review_comment` separately
+    /// risks the two using subtly different hunk-key snapshots, which makes
+    /// `dismiss_overlays_without_comments` (run on every subsequent overlay
+    /// open) treat the existing thread as empty and remove it.
+    pub fn inject_remote_review_comment(
+        &mut self,
+        display_row: DisplayRow,
+        comment: String,
+        author: SharedString,
+        avatar_url: Option<SharedUri>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        self.show_diff_review_overlay(display_row..display_row, window, cx);
+        // The most recently-pushed overlay is the one we just created (or
+        // re-focused) above. Reuse its hunk_key + anchor_range so the comment
+        // attaches to exactly the same hunk the overlay watches.
+        let overlay = self.diff_review_overlays.last()?;
+        let hunk_key = overlay.hunk_key.clone();
+        let anchor_range = overlay.anchor_range.clone();
+        Some(self.add_remote_review_comment(
+            hunk_key,
+            comment,
+            anchor_range,
+            author,
+            avatar_url,
+            cx,
+        ))
+    }
+
+    fn add_review_comment_inner(
+        &mut self,
+        hunk_key: DiffHunkKey,
+        mut stored_comment: StoredReviewComment,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let id = self.next_review_comment_id;
         self.next_review_comment_id += 1;
-
-        let stored_comment = StoredReviewComment::new(id, comment, anchor_range);
+        stored_comment.id = id;
 
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let key_point = hunk_key.hunk_start_anchor.to_point(&snapshot);
@@ -23579,6 +23700,8 @@ impl Editor {
                     avatar_size,
                     action_icon_size,
                     colors,
+                    editor_handle.clone(),
+                    hunk_key.clone(),
                 ))
             })
             .into_any_element()
@@ -23592,6 +23715,8 @@ impl Editor {
         avatar_size: Pixels,
         action_icon_size: IconSize,
         colors: &theme::ThemeColors,
+        editor_handle: WeakEntity<Editor>,
+        hunk_key: DiffHunkKey,
     ) -> impl IntoElement {
         let comment_count = comments.len();
 
@@ -23610,11 +23735,40 @@ impl Editor {
                     .cursor_pointer()
                     .rounded_md()
                     .hover(|style| style.bg(colors.ghost_element_hover))
-                    .on_click(|_, window: &mut Window, cx| {
-                        window.dispatch_action(
-                            Box::new(crate::actions::ToggleReviewCommentsExpanded),
-                            cx,
-                        );
+                    // Stop the click from falling through to the editor
+                    // beneath the overlay block; without this the chevron
+                    // toggle just moved the editor cursor into the diff.
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click({
+                        // Toggle THIS overlay's comments_expanded directly via
+                        // the editor handle + hunk_key, bypassing the action
+                        // dispatcher (which can't route to the right overlay
+                        // when multiple are open).
+                        let editor_handle = editor_handle.clone();
+                        let hunk_key = hunk_key.clone();
+                        move |_, window: &mut Window, cx| {
+                            let _ = editor_handle.update(cx, |editor, cx| {
+                                let snapshot = editor.buffer.read(cx).snapshot(cx);
+                                if let Some(overlay) =
+                                    editor.diff_review_overlays.iter_mut().find(|o| {
+                                        Editor::hunk_keys_match(
+                                            &o.hunk_key,
+                                            &hunk_key,
+                                            &snapshot,
+                                        )
+                                    })
+                                {
+                                    overlay.comments_expanded = !overlay.comments_expanded;
+                                    let key = overlay.hunk_key.clone();
+                                    editor.refresh_diff_review_overlay_height(
+                                        &key, window, cx,
+                                    );
+                                    cx.notify();
+                                }
+                            });
+                        }
                     })
                     .child(
                         Icon::new(if expanded {
@@ -23661,10 +23815,16 @@ impl Editor {
     ) -> impl IntoElement {
         let comment_id = comment.id;
         let is_editing = inline_editor.is_some();
+        let is_remote = comment.is_remote;
+        // Prefer the comment's own avatar (e.g. GitHub PR remote comments);
+        // fall back to the local user avatar so locally-authored comments
+        // still render their account picture.
+        let avatar_uri = comment.avatar_url.clone().or_else(|| user_avatar_uri.clone());
+        let author = comment.author.clone();
 
         h_flex()
             .w_full()
-            .items_center()
+            .items_start()
             .gap_2()
             .px_2()
             .py_1p5()
@@ -23676,7 +23836,7 @@ impl Editor {
                     .flex_shrink_0()
                     .rounded_full()
                     .overflow_hidden()
-                    .child(if let Some(ref avatar_uri) = user_avatar_uri {
+                    .child(if let Some(ref avatar_uri) = avatar_uri {
                         Avatar::new(avatar_uri.clone())
                             .size(avatar_size)
                             .into_any_element()
@@ -23691,6 +23851,7 @@ impl Editor {
                 // Inline edit mode: show an editable text field
                 div()
                     .flex_1()
+                    .min_w_0()
                     .border_1()
                     .border_color(colors.border)
                     .rounded_md()
@@ -23700,12 +23861,30 @@ impl Editor {
                     .child(editor)
                     .into_any_element()
             } else {
-                // Display mode: show the comment text
-                div()
+                // Display mode: stack author header (if present) above the body
+                // so remote comments read like a GitHub thread reply. `min_w_0`
+                // + `whitespace_normal` lets long bodies soft-wrap inside the
+                // overlay instead of overflowing horizontally.
+                v_flex()
                     .flex_1()
-                    .text_sm()
-                    .text_color(colors.text)
-                    .child(comment.comment)
+                    .min_w_0()
+                    .gap_0p5()
+                    .when_some(author.clone(), |col, name| {
+                        col.child(
+                            Label::new(name)
+                                .size(LabelSize::XSmall)
+                                .weight(gpui::FontWeight::SEMIBOLD)
+                                .color(ui::Color::Default),
+                        )
+                    })
+                    .child(
+                        div()
+                            .w_full()
+                            .text_sm()
+                            .text_color(colors.text)
+                            .whitespace_normal()
+                            .child(comment.comment),
+                    )
                     .into_any_element()
             })
             .child(if is_editing {

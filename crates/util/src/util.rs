@@ -2,6 +2,7 @@ pub mod archive;
 pub mod command;
 pub mod disambiguate;
 pub mod fs;
+pub mod github_auth;
 pub mod markdown;
 pub mod path_list;
 pub mod paths;

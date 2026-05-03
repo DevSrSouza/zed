@@ -13242,6 +13242,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "pr_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "buffer_diff",
+ "collections",
+ "editor",
+ "futures 0.3.32",
+ "git",
+ "git_hosting_providers",
+ "git_ui",
+ "gpui",
+ "http_client",
+ "language",
+ "log",
+ "markdown",
+ "multi_buffer",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "text",
+ "theme",
+ "ui",
+ "util",
+ "which 6.0.3",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22471,6 +22502,7 @@ dependencies = [
  "paths",
  "picker",
  "pkg-config",
+ "pr_panel",
  "pretty_assertions",
  "profiling",
  "project",

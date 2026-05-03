@@ -137,7 +137,7 @@ impl Github {
             .header("Content-Type", "application/json")
             .follow_redirects(http_client::RedirectPolicy::FollowAll);
 
-        if let Ok(github_token) = std::env::var("GITHUB_TOKEN") {
+        if let Some(github_token) = util::github_auth::github_token().await {
             request = request.header("Authorization", format!("Bearer {}", github_token));
         }
 

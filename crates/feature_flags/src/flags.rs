@@ -44,6 +44,14 @@ impl FeatureFlag for DiffReviewFeatureFlag {
     fn enabled_for_staff() -> bool {
         false
     }
+
+    // Force-enabled in the claude-review-v2 fork so the inline review-comment
+    // composer shows up on every diff view (uncommitted changes, branch diff,
+    // and the PR-panel files view) without requiring a `feature_flags`
+    // override in settings.json.
+    fn enabled_for_all() -> bool {
+        true
+    }
 }
 register_feature_flag!(DiffReviewFeatureFlag);
 

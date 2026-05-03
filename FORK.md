@@ -11,6 +11,96 @@ Use:
 
 Closing the review window without sending exits non-zero — skill reports "review cancelled".
 
+# Pull Request Panel (`gh`-backed)
+
+New left-dock panel between Git (priority 3) and Collab (priority 5). Browse, read, and review GitHub pull requests for the current project's GitHub remote without leaving Zed. Reuses the **same inline review-comment overlay UI** that claude-review's `/start-review` flow uses — but bound to a real GitHub PR instead of a local diff session.
+
+Activates when:
+
+- The active project has a `github.com` remote (parsed from `origin` URL — handles `https://`, `git@`, `ssh://` forms).
+- A GitHub API token is resolvable via `util::github_auth::github_token()` (env var `GITHUB_TOKEN` or `gh auth token` fallback — see "GitHub Token" section below).
+
+If either gate fails, the panel renders a hint instead of a list. Repository discovery is asynchronous on cold opens; the panel subscribes to `GitStoreEvent` and auto-populates as soon as the worktree's git remotes finish loading — no need to click Refresh.
+
+## PR list panel
+
+- Open PRs sorted by recently-updated (cap: GitHub's default 100/page). Title, `#N`, author, head branch, draft state.
+- Per-row "open in browser" icon.
+- Header refresh button.
+- Auto-refresh on every panel activation (initial reveal, switching back from another panel, restored layout). No periodic poll.
+- Click a row → opens an overview tab (`PrView`).
+
+## PR overview tab (`PrView`)
+
+- **Header**: author avatar, title, `#N`, mergeability **status pill** (`Mergeable` ✓ / `Conflicts` ⚠ / `Checking` ⟳), **Files (N)** button, **Checkout** button (separate, opt-in `gh pr checkout`), "open on GitHub" link, `by author · head → base`, `+adds −dels · K files`.
+- **Description**: rendered Markdown of the PR body.
+- **CI checks**: per-workflow row — status icon, name, colored outcome (success / failure / cancelled / skipped / neutral / timed out / action required / queued / running). Each row clickable → opens that check on github.com. Backed by `GET /commits/:sha/check-runs`.
+- **File review comments summary**: one-line banner showing `N file review comment(s) — open the Files tab to read and reply inline.` Hidden when count is 0.
+- **Commits**: per-commit row — author avatar, short sha (mono), first-line message, author name. Click → opens commit on github.com. Backed by `GET /pulls/:n/commits`.
+- **Conversation timeline**: top-level (Issue API) comments only — not duplicated with the line-anchored ones (those live in Files). Each comment renders with avatar + bold author + soft-wrapping body.
+- **Composer + 3 buttons**: Comment (top-level conversation), Approve, Request changes. Empty body allowed for Approve / Request-changes.
+- All endpoints fan out via `futures::join!` so the tab paints in roughly the slowest call's time, not the sum.
+
+## Files diff tab (`PrFilesView`)
+
+- **In-memory side-by-side diff**, never touches the working tree (no checkout, no fetch, no staging).
+- For each changed file: fetches base content at the PR's `base_ref` and head content at the PR's `head_sha` via the GitHub `contents` API. Builds a synthetic `Buffer` (with a synthetic `language::File` so the multi-buffer header banner shows the real filename instead of "untitled") + a `BufferDiff` whose base text is the base content. Assembles all files into a single `MultiBuffer` rendered through a `SplittableEditor` (left = base, right = head; settings-driven via `EditorSettings.diff_view_style`).
+- **Tree-sitter syntax highlighting** on both sides via `LanguageRegistry::load_language_for_file_path`.
+- **All hunks expanded** by default (`set_all_diff_hunks_expanded`).
+- **Parallel file fetching** — concurrency 6 via `FuturesOrdered`, order preserved so excerpts appear in PR order. Progress shown as `Fetching X of Y: path/to/file`.
+- **Breakpoint dots, inline diagnostics, runnable indicators** all hidden (none of them mean anything for a PR diff outside the worktree).
+
+## Inline line comments
+
+- Reuses **claude-review's diff-review overlay UI** (the same `+` button per line + drag-to-multiselect + popup composer + stacked thread block that `/start-review` already uses). Enabled by force-flipping `DiffReviewFeatureFlag::enabled_for_all = true` in this fork.
+- **Existing PR review comments load into the same overlay** — `Editor::add_remote_review_comment(...)` stores them in the editor's `stored_review_comments` with author + avatar + remote flag, so they render in the same `render_comment_row` path as locally typed ones (no separate "block decoration" code). Each commented line auto-opens its overlay via `Editor::inject_remote_review_comment(display_row, body, author, avatar, ...)` so threads are visible without clicking `+`.
+- **New comments**: drag-select line range → composer pops below → type → Enter. The local `EditorEvent::ReviewCommentsChanged` subscription POSTs every newly-stored comment to GitHub via `POST /pulls/:n/reviews` with `event=COMMENT` + `comments=[{path, line, side: "RIGHT", body}]` + `commit_id=head_sha` (matches GitHub's "single comment review" path). Local IDs tracked in `posted_comment_ids` to prevent double-post on `fetch` round-trip.
+- **ESC** dismisses the empty composer only; overlays with stored threads stay open (`dismiss_overlays_without_comments` instead of `dismiss_all_diff_review_overlays`).
+- **Chevron toggle** (collapse/expand thread) targets the correct overlay via `editor_handle.update + hunk_keys_match`, even with multiple overlays open. Header click also stops mouse-down propagation so the editor underneath doesn't take focus.
+- Comment bodies **soft-wrap** (`min_w_0` + `whitespace_normal`); overlay block height is sized from per-comment body length so long threads don't clip.
+
+## Editor changes (used by both PR view and existing claude-review)
+
+- `StoredReviewComment` gained `author: Option<SharedString>`, `avatar_url: Option<SharedUri>`, `is_remote: bool`.
+- `Editor::add_remote_review_comment(...)` stores remote-attributed comments.
+- `Editor::inject_remote_review_comment(display_row, ...)` opens the overlay AND stores the comment with the same hunk_key the overlay just computed (single atomic step — fixes a snapshot-drift bug where opening a `+` later would dismiss remote-comment overlays because their hunk_keys didn't match).
+- `render_comment_row` shows per-comment author + avatar above the body when present (falls back to the local user's avatar when not).
+- `calculate_overlay_height` estimates rows from each comment body's length so wrapped text doesn't get clipped.
+
+## What it does **not** do (yet)
+
+- No filters beyond `state=open`. No author / assignee / reviewer / label filtering. No pagination past the first 100.
+- No reply-to-existing-thread (a new line comment posts a fresh single-comment review; it doesn't post into an existing GitHub review thread).
+- No resolve / unresolve thread.
+- No webhook or push-based realtime updates — the panel auto-refreshes only on activation, not while it's already open.
+- No support for self-hosted GitHub Enterprise URLs (only `github.com` is parsed).
+
+Implementation: `crates/pr_panel/`. Four files: `pr_panel.rs` (Panel + PR list + auto-refresh on activate / GitStore events), `pr_view.rs` (overview tab: header, CI checks, commits, description, conversation, composer), `pr_files_view.rs` (read-only side-by-side multibuffer + claude-review overlay integration), `github_api.rs` (typed REST wrapper). Auth flows through `util::github_auth`. Dock activation priority `4` puts the icon left of Collab.
+
+# GitHub Token — `gh` CLI Auto-Auth Fallback
+
+Zed reaches GitHub's REST API in two places: latest-release lookups for built-in LSP / DAP / extension downloads (`http_client::github`) and commit-author avatars in blame popovers (`git_hosting_providers::github`). Upstream, both call sites only authenticate when the `GITHUB_TOKEN` environment variable is set; otherwise the requests go out unauthenticated and hit the 60 req/hr/IP limit, which manifests as `403 rate limit exceeded` on cold starts behind a busy NAT.
+
+This fork adds a second resolution step. If `GITHUB_TOKEN` is missing, Zed shells out to `gh auth token` (the [GitHub CLI](https://cli.github.com)). When `gh` is installed and already authenticated, the request gets the user's existing token transparently — no Zed-side login flow, no keychain entry, no extra config.
+
+Resolution order (memoized for the process lifetime, first non-empty wins):
+
+1. `GITHUB_TOKEN` env var.
+2. `gh auth token` stdout, when `gh` is on `PATH`.
+
+If neither yields a token, requests stay unauthenticated (upstream behavior).
+
+Use:
+
+- Already on `gh`? Nothing to do — `gh auth status` should show "Logged in to github.com".
+- Need to log in: `gh auth login`.
+- Force a specific token instead of using `gh`: export `GITHUB_TOKEN=…`. The env var always wins.
+- Rotated `gh` credentials? Restart Zed — the resolved token is cached for the process lifetime (matches the existing `GITHUB_TOKEN` contract).
+
+Implementation: `crates/util/src/github_auth.rs` exposes `util::github_auth::github_token() -> Option<&'static str>`. Both call sites await it instead of reading the env var directly. The `gh` subprocess is only spawned the first time a token is requested and only when `gh` is actually on `PATH` (`which` lookup gates the spawn).
+
+This does **not** unlock any new authenticated GitHub features — it only removes the rate-limit cliff for the API calls Zed already makes. The Copilot sign-in flow has its own device-flow auth and is unrelated.
+
 # Search Everywhere (`shift shift`)
 
 Inspired by IntelliJ IDEs' Search Everywhere. Unified fuzzy picker — files + actions in one modal. Bound in JetBrains keymap.

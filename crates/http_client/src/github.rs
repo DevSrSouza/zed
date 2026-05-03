@@ -39,9 +39,10 @@ pub async fn latest_github_release(
 ) -> anyhow::Result<GithubRelease> {
     let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/releases");
 
+    let token = util::github_auth::github_token().await;
     let request = Request::get(&url)
         .follow_redirects(crate::RedirectPolicy::FollowAll)
-        .when_some(std::env::var("GITHUB_TOKEN").ok(), |builder, token| {
+        .when_some(token, |builder, token| {
             builder.header("Authorization", format!("Bearer {}", token))
         })
         .body(Default::default())?;
@@ -101,9 +102,10 @@ pub async fn get_release_by_tag_name(
 ) -> anyhow::Result<GithubRelease> {
     let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/releases/tags/{tag}");
 
+    let token = util::github_auth::github_token().await;
     let request = Request::get(&url)
         .follow_redirects(crate::RedirectPolicy::FollowAll)
-        .when_some(std::env::var("GITHUB_TOKEN").ok(), |builder, token| {
+        .when_some(token, |builder, token| {
             builder.header("Authorization", format!("Bearer {}", token))
         })
         .body(Default::default())?;

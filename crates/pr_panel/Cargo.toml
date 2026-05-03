@@ -1,0 +1,40 @@
+[package]
+name = "pr_panel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+name = "pr_panel"
+path = "src/pr_panel.rs"
+
+[dependencies]
+anyhow.workspace = true
+buffer_diff.workspace = true
+collections.workspace = true
+editor.workspace = true
+multi_buffer.workspace = true
+text.workspace = true
+futures.workspace = true
+git.workspace = true
+git_hosting_providers.workspace = true
+gpui.workspace = true
+http_client.workspace = true
+language.workspace = true
+git_ui.workspace = true
+log.workspace = true
+markdown.workspace = true
+project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+theme.workspace = true
+ui.workspace = true
+util.workspace = true
+which.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true

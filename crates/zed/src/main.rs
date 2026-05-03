@@ -416,6 +416,18 @@ fn main() {
                 #[cfg(unix)]
                 util::load_login_shell_environment().await.log_err();
                 shell_env_loaded_tx.send(()).ok();
+
+                // Warm the GitHub token cache after the login shell PATH is in
+                // place so `gh` (often installed via Homebrew) is on PATH. Also
+                // surfaces the resolution outcome in logs for diagnostics.
+                match util::github_auth::github_token().await {
+                    Some(_) => log::info!(
+                        "github_auth: token resolved (GITHUB_TOKEN or `gh auth token`)"
+                    ),
+                    None => log::info!(
+                        "github_auth: no token (GITHUB_TOKEN unset and `gh` unavailable or unauthed)"
+                    ),
+                }
             })
             .detach()
     } else {
