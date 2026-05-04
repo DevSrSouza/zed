@@ -286,6 +286,168 @@ struct DynamicRegistrations {
     diagnostics: HashMap<Option<String>, DiagnosticServerCapabilities>,
 }
 
+/// claude-review-v2 fork — Smart Mode go-to-definition
+/// fallback. Reads the identifier under the cursor and asks
+/// `project::cache_fallback::lookup` whether the persistent
+/// symbol index has a declaration with that exact name in any
+/// of the workspace's visible repos. Returns one
+/// `LocationLink` per match; opens cache-resident buffers via
+/// the worktree-keyed `BufferStore::open_buffer` flow so the
+/// returned `Location` is fully materialized (Anchor-bearing).
+///
+/// Empty `Vec` on cache miss, no callback registered, or any
+/// I/O error — the fallback is fail-soft.
+async fn cache_definition_fallback(
+    weak: WeakEntity<LspStore>,
+    buffer: Entity<Buffer>,
+    position: PointUtf16,
+    cx: &mut AsyncApp,
+) -> Vec<LocationLink> {
+    let Some(identifier) = cx.update(|app| {
+        let snapshot = buffer.read(app).snapshot();
+        word_at_position(&snapshot, position)
+    }) else {
+        return Vec::new();
+    };
+
+    let Some(lsp_store) = weak.upgrade() else {
+        return Vec::new();
+    };
+
+    // Snapshot the worktree set so we can both query the
+    // cache (abs paths) and resolve hits back to a worktree
+    // (for buffer open).
+    let worktrees: Vec<(WorktreeId, std::path::PathBuf)> = cx.update(|app| {
+        lsp_store
+            .read(app)
+            .worktree_store
+            .read(app)
+            .visible_worktrees(app)
+            .map(|worktree| {
+                let snapshot = worktree.read(app);
+                (snapshot.id(), snapshot.abs_path().to_path_buf())
+            })
+            .collect::<Vec<_>>()
+    });
+    if worktrees.is_empty() {
+        return Vec::new();
+    }
+    let repo_paths: Vec<std::path::PathBuf> =
+        worktrees.iter().map(|(_, p)| p.clone()).collect();
+
+    let mut hits = cx.update(|cx| crate::cache_fallback::lookup(cx, &identifier, &repo_paths));
+    if hits.is_empty() {
+        return Vec::new();
+    }
+
+    // claude-review-v2 fork — language-aware ranking. The
+    // cache is keyed by symbol name only, so a cmd+click on
+    // `Foo` in `Bar.swift` could also match a Kotlin `Foo`
+    // unrelated to the Swift symbol. Prefer cached entries
+    // whose file extension matches the source buffer's. Fall
+    // through to other-extension hits if there's no same-
+    // extension match — better than returning nothing,
+    // especially for KMP-style cross-language nav.
+    let source_ext: Option<String> = cx.update(|app| {
+        let snapshot = buffer.read(app).snapshot();
+        snapshot
+            .file()
+            .and_then(|f| {
+                let path = language::File::path(f.as_ref());
+                path.as_unix_str().rsplit('.').next().map(str::to_string)
+            })
+    });
+    if let Some(ref ext) = source_ext {
+        let dot_ext = format!(".{ext}");
+        hits.sort_by_key(|(abs, _, _)| {
+            let ends_with = abs
+                .to_str()
+                .map(|s| s.ends_with(&dot_ext))
+                .unwrap_or(false);
+            if ends_with { 0 } else { 1 }
+        });
+    }
+
+    let mut out = Vec::with_capacity(hits.len());
+    for (abs_path, start, end) in hits {
+        let Some((worktree_id, rel_path)) = worktrees.iter().find_map(|(id, root)| {
+            abs_path.strip_prefix(root).ok().and_then(|stripped| {
+                let s = stripped.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+                util::rel_path::RelPath::unix(&s)
+                    .ok()
+                    .map(|rel| (*id, rel.into_arc()))
+            })
+        }) else {
+            continue;
+        };
+
+        // Open the target buffer via the project's buffer
+        // store. Returns existing if already open.
+        let target_buffer_handle = lsp_store.update(cx, |lsp_store, cx| {
+            let buffer_store = lsp_store.buffer_store.clone();
+            buffer_store.update(cx, |store, cx| {
+                store.open_buffer(
+                    ProjectPath {
+                        worktree_id,
+                        path: rel_path,
+                    },
+                    cx,
+                )
+            })
+        });
+        let target_buffer = match target_buffer_handle.await {
+            Ok(b) => b,
+            Err(err) => {
+                log::debug!("cache_definition_fallback: open_buffer failed for {abs_path:?}: {err:#}");
+                continue;
+            }
+        };
+
+        let location = cx.update(|cx| {
+            let snapshot = target_buffer.read(cx);
+            let start_clipped = snapshot.clip_point_utf16(language::Unclipped(start), Bias::Left);
+            let end_clipped = snapshot.clip_point_utf16(language::Unclipped(end), Bias::Left);
+            Location {
+                buffer: target_buffer.clone(),
+                range: snapshot.anchor_after(start_clipped)..snapshot.anchor_before(end_clipped),
+            }
+        });
+        out.push(LocationLink {
+            origin: None,
+            target: location,
+        });
+    }
+    out
+}
+
+/// Word-boundary identifier at `position` in `snapshot`. Used
+/// only by the Smart Mode cache fallback above; no need for
+/// Unicode-aware language-specific tokenization since cached
+/// symbol names are themselves identifiers.
+fn word_at_position(snapshot: &BufferSnapshot, position: PointUtf16) -> Option<String> {
+    let offset = snapshot.point_utf16_to_offset(position);
+    let text = snapshot.text();
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let pos = offset.min(bytes.len());
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut start = pos;
+    while start > 0 && is_id(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = pos;
+    while end < bytes.len() && is_id(bytes[end]) {
+        end += 1;
+    }
+    if start == end {
+        return None;
+    }
+    Some(text[start..end].to_string())
+}
+
 /// claude-review-v2 fork — JetBrains Fleet "Smart Mode" override
 /// store. Set by the bottom-bar Language Servers popover when
 /// the user clicks "Enable" on a gated server. Backs the
@@ -4048,7 +4210,7 @@ impl LocalLspStore {
         Ok(workspace_config)
     }
 
-    fn language_server_for_id(&self, id: LanguageServerId) -> Option<Arc<LanguageServer>> {
+    pub fn language_server_for_id(&self, id: LanguageServerId) -> Option<Arc<LanguageServer>> {
         if let Some(LanguageServerState::Running { server, .. }) = self.language_servers.get(&id) {
             Some(server.clone())
         } else if let Some((_, server)) = self.supplementary_language_servers.get(&id) {
@@ -6126,15 +6288,35 @@ impl LspStore {
                 GetDefinitions { position },
                 cx,
             );
-            cx.background_spawn(async move {
-                Ok(Some(
-                    definitions_task
-                        .await
-                        .into_iter()
-                        .flat_map(|(_, definitions)| definitions)
-                        .dedup()
-                        .collect(),
-                ))
+            // claude-review-v2 fork — Smart Mode go-to-def
+            // fallback. When LSPs return nothing for a
+            // position (typical when Smart Mode is off and
+            // no servers are running), look the identifier
+            // at the cursor up in the persistent symbol
+            // cache (`project_index`). Cache hits are
+            // converted into `LocationLink`s pointing at the
+            // recorded file/range. Live LSP results — when
+            // present — always win; this branch only fires
+            // on an empty result.
+            let buffer_for_fallback = buffer.clone();
+            cx.spawn(async move |this, cx| {
+                let live: Vec<LocationLink> = definitions_task
+                    .await
+                    .into_iter()
+                    .flat_map(|(_, definitions)| definitions)
+                    .dedup()
+                    .collect();
+                if !live.is_empty() {
+                    return Ok(Some(live));
+                }
+                let fallback = cache_definition_fallback(
+                    this,
+                    buffer_for_fallback,
+                    position,
+                    cx,
+                )
+                .await;
+                Ok(Some(fallback))
             })
         }
     }

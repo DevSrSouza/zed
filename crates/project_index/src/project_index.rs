@@ -26,8 +26,19 @@
 
 pub mod collector;
 
-use gpui::{App, AppContext as _};
+use gpui::{App, AppContext as _, actions};
 use std::time::Duration;
+
+actions!(
+    zed,
+    [
+        /// Drop every Smart Mode symbol cache row for the
+        /// current workspace's visible worktrees. Useful
+        /// when the cache has gone stale (rare — eviction
+        /// is automatic) or when troubleshooting.
+        ClearProjectIndexCache
+    ]
+);
 
 /// Cache-row eviction window. Symbols whose owning file row
 /// has not been refreshed in this long are dropped on startup.
@@ -37,17 +48,22 @@ use std::time::Duration;
 const EVICTION_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 30);
 
 /// Initialize Smart Mode symbol caching. Called once from
-/// `zed::main`. Spawns a per-project collector each time a
-/// workspace is created.
+/// `zed::main`.
+///
+/// Three things happen here:
+/// 1. Eviction sweep (drop rows whose `last_seen` is older
+///    than 30 days).
+/// 2. Per-project collector spawned on every workspace open.
+/// 3. Cache-backed go-to-definition fallback registered with
+///    `project::cache_fallback`. `LspStore::definitions`
+///    calls into this when the live LSP returns nothing,
+///    converting cached symbol locations into go-to-def
+///    results.
 ///
 /// The collector loop self-terminates once the project entity
-/// is dropped (it polls a `WeakEntity` and exits on `None`),
-/// so detaching the task is safe — no manual unregister
-/// required.
+/// is dropped, so detaching the task is safe — no manual
+/// unregister required.
 pub fn init(cx: &mut App) {
-    // One-shot startup eviction. Dropped tasks just abandon
-    // the future; nothing else holds the join handle so we
-    // detach.
     let db = ProjectIndexDB::global(cx);
     cx.spawn(async move |_cx| {
         let cutoff_secs = std::time::SystemTime::now()
@@ -61,9 +77,65 @@ pub fn init(cx: &mut App) {
     })
     .detach();
 
+    project::cache_fallback::register_definition_lookup(Box::new(
+        |cx, identifier, repos| {
+            let db = ProjectIndexDB::global(cx);
+            let mut hits: Vec<project::cache_fallback::CachedDefinition> = Vec::new();
+            for repo in repos {
+                let repo_str = repo.to_string_lossy();
+                match db.lookup_exact(&repo_str, identifier) {
+                    Ok(rows) => {
+                        for row in rows {
+                            let abs = std::path::PathBuf::from(&row.repo_path)
+                                .join(&row.rel_path);
+                            let start = language::PointUtf16::new(
+                                row.range_start_row,
+                                row.range_start_col,
+                            );
+                            let end = language::PointUtf16::new(
+                                row.range_end_row,
+                                row.range_end_col,
+                            );
+                            hits.push((abs, start, end));
+                        }
+                    }
+                    Err(err) => log::debug!(
+                        "project_index cache_fallback: lookup_exact {repo_str:?} {identifier:?} failed: {err:#}"
+                    ),
+                }
+            }
+            hits
+        },
+    ));
+
     cx.observe_new(|workspace: &mut workspace::Workspace, _window, cx| {
         let project = workspace.project().clone();
-        collector::install(project, cx).detach();
+        collector::install(project.clone(), cx).detach();
+        workspace.register_action(
+            move |workspace, _: &ClearProjectIndexCache, _window, cx| {
+                let repos: Vec<String> = workspace
+                    .project()
+                    .read(cx)
+                    .worktree_store()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .map(|w| w.read(cx).abs_path().to_string_lossy().to_string())
+                    .collect();
+                let db = ProjectIndexDB::global(cx);
+                cx.spawn(async move |_, _cx| {
+                    for repo in repos {
+                        if let Err(err) = db.clear_repo(repo.clone()).await {
+                            log::warn!(
+                                "project_index: clear_repo {repo:?} failed: {err:#}"
+                            );
+                        } else {
+                            log::info!("project_index: cleared cache for {repo}");
+                        }
+                    }
+                })
+                .detach();
+            },
+        );
     })
     .detach();
 }

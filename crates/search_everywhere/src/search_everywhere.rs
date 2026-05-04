@@ -683,18 +683,25 @@ impl PickerDelegate for SearchEverywhereDelegate {
             // when this whole future is dropped (which happens as
             // soon as the user types a new character, replacing the
             // outer `update_matches` task).
+            //
+            // `'phase2` labeled block lets us bail out of just this
+            // section — phase 3 (the persistent symbol cache) runs
+            // afterwards regardless of whether the LSP returned
+            // anything, since the cache is meant for exactly the
+            // case where LSPs are silent.
+            'phase2: {
             let Some(symbols_task) = symbols_task else {
-                return;
+                break 'phase2;
             };
             let symbols = match symbols_task.await {
                 Ok(s) => s,
                 Err(err) => {
                     log::debug!("search_everywhere: workspace/symbol failed: {err:#}");
-                    return;
+                    break 'phase2;
                 }
             };
             if cancel_flag.load(std::sync::atomic::Ordering::Acquire) || symbols.is_empty() {
-                return;
+                break 'phase2;
             }
 
             // Drop symbols that originate outside the project's
@@ -713,7 +720,7 @@ impl PickerDelegate for SearchEverywhereDelegate {
                 })
                 .collect();
             if symbols.is_empty() {
-                return;
+                break 'phase2;
             }
 
             // Re-rank server-supplied symbols by fuzzy-matching
@@ -739,7 +746,7 @@ impl PickerDelegate for SearchEverywhereDelegate {
             )
             .await;
             if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
-                return;
+                break 'phase2;
             }
 
             let mut symbol_hits: Vec<(u8, f64, Hit)> = Vec::with_capacity(symbol_matches.len());
@@ -778,6 +785,7 @@ impl PickerDelegate for SearchEverywhereDelegate {
                     cx.notify();
                 })
                 .ok();
+            } // 'phase2 block end
 
             // Phase 3: Smart Mode persistent symbol cache.
             // Reads from `ProjectIndexDB` (SQLite + FTS5)
@@ -785,8 +793,13 @@ impl PickerDelegate for SearchEverywhereDelegate {
             // LSPs were running in prior or current sessions.
             // Always queried, even when LSPs are off — this
             // is the whole point of the cache.
+            log::info!(
+                "search_everywhere phase3: query={query:?} repos={}",
+                cache_repo_paths.len()
+            );
             if !cache_repo_paths.is_empty() {
                 let pattern = fts_prefix_query(&query);
+                log::info!("search_everywhere phase3: fts pattern {pattern:?}");
                 let db = cx.update(|cx| ProjectIndexDB::global(cx));
                 let cached_symbols: Vec<CachedSymbol> = cx
                     .background_executor()
@@ -806,7 +819,12 @@ impl PickerDelegate for SearchEverywhereDelegate {
                     })
                     .await;
 
+                log::info!(
+                    "search_everywhere phase3: db returned {} symbols",
+                    cached_symbols.len()
+                );
                 if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    log::info!("search_everywhere phase3: cancelled before publish");
                     return;
                 }
 
@@ -862,13 +880,17 @@ impl PickerDelegate for SearchEverywhereDelegate {
                 // Cache hit: open the file at the recorded
                 // path + range. No `Project::open_buffer_for_symbol`
                 // because the cache row isn't tied to a live
-                // language server entity.
+                // language server entity. After the file
+                // opens we downcast to `Editor` and move the
+                // cursor to (row, col), centering the
+                // viewport on it — same UX as a live LSP
+                // go-to-def hop.
                 let workspace = self.workspace.clone();
                 let abs_path = PathBuf::from(&symbol.repo_path).join(&symbol.rel_path);
                 let row = symbol.range_start_row;
                 let col = symbol.range_start_col;
                 cx.spawn_in(window, async move |_, cx| {
-                    workspace
+                    let item = workspace
                         .update_in(cx, |workspace, window, cx| {
                             workspace.open_abs_path(
                                 abs_path,
@@ -880,9 +902,32 @@ impl PickerDelegate for SearchEverywhereDelegate {
                                 cx,
                             )
                         })?
-                        .await
-                        .ok();
-                    let _ = (row, col);
+                        .await?;
+                    workspace.update_in(cx, |_workspace, window, cx| {
+                        let Some(editor) = item.downcast::<Editor>() else {
+                            return;
+                        };
+                        editor.update(cx, |editor, cx| {
+                            let snapshot = editor.buffer().read(cx).snapshot(cx);
+                            let Some(buffer_snapshot) = snapshot.as_singleton() else {
+                                return;
+                            };
+                            let position = buffer_snapshot.clip_point_utf16(
+                                language::Unclipped(language::PointUtf16::new(row, col)),
+                                Bias::Left,
+                            );
+                            let text_anchor = buffer_snapshot.anchor_before(position);
+                            let Some(anchor) = snapshot.anchor_in_buffer(text_anchor) else {
+                                return;
+                            };
+                            editor.change_selections(
+                                SelectionEffects::scroll(Autoscroll::center()),
+                                window,
+                                cx,
+                                |s| s.select_ranges([anchor..anchor]),
+                            );
+                        });
+                    })?;
                     anyhow::Ok(())
                 })
                 .detach_and_log_err(cx);

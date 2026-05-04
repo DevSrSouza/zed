@@ -8,6 +8,7 @@ pub mod context_server_store;
 pub mod debounced_delay;
 pub mod debugger;
 pub mod git_store;
+pub mod cache_fallback;
 pub mod image_store;
 pub mod jar_extract;
 pub mod kmp_swift_to_kotlin;

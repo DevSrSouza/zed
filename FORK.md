@@ -607,16 +607,95 @@ Tantivy would be objectively faster for the FTS workload — Lucene-style invert
 
 If the corpus ever outgrows SQLite (millions of symbols across hundreds of repos), porting the FTS layer to Tantivy is straightforward — the `search_fts` API is the only public read surface and could swap implementations.
 
-## Limits
+## documentSymbol disk-walk fallback
 
-- `workspace/symbol("")` semantics vary per LSP. Some return everything; some return nothing on empty query; kotlin-lsp returns up to 10k matched symbols only when the query is non-empty. We use the empty-query form because it's the documented "give me all" semantic; servers that don't honor it just won't contribute to the cache. v2 could supplement with periodic per-file `documentSymbol` sweeps over open buffers.
-- Range jumping for cache hits isn't wired through the editor yet. Confirm just opens the file. Live LSP hits still jump to the exact range.
-- No go-to-definition fallback in v1. The infrastructure (lookup-by-name) is in place; hooking into `LspStore::definitions` is a follow-up.
-- Cache rows include the LSP `server_name` they came from. If you uninstall an extension, its rows linger until eviction. Acceptable trade-off for now; a manual "clear cache" UI command is straightforward to add.
+Some LSPs (sourcekit-lsp in particular) return nothing for the empty `workspace/symbol("")` query — they only answer when given a real prefix. After the main sweep finishes, the collector tracks which servers actually wrote rows; servers that contributed zero rows fall through to a per-file `documentSymbol` walk:
+
+1. Walk every visible worktree's path index. Bucket files by extension.
+2. Resolve each language server's claimed extensions and `languageId` from `LanguageRegistry::available_language_for_name(...).matcher().path_suffixes` and `CachedLspAdapter::language_id(...)` — strictly data-driven, no hardcoded "if name == sourcekit-lsp" logic.
+3. For each (server, file): bypass the Buffer entity and talk to `lsp::LanguageServer` directly:
+   - `textDocument/didOpen` with the file's raw bytes read off disk.
+   - 800 ms settle so the server's first-pass analysis can land. Without this delay sourcekit-lsp returns instant empty results.
+   - `textDocument/documentSymbol`.
+   - `textDocument/didClose`.
+4. Flatten the response (Nested or Flat) into `CachedSymbol`s tagged with the actual `server_name`.
+5. Write to the DB in the same `replace_file_symbols` flow.
+
+Servers that DID contribute via `workspace/symbol` (e.g. kotlin-lsp returning 41k+ symbols at once) are explicitly skipped — re-running documentSymbol for files the broader query already indexed is wasted work and gets logged as `skipping per-file disk-walk for servers that already contributed via workspace/symbol: <name>`.
+
+`.xcframework/` paths are filtered out before the walk: third-party pre-built framework bundles ship one `.swiftinterface` per architecture × per slice, indexing them all multiplies dependency-internal symbols 4-6× without value.
+
+## Parallelism + background
+
+The disk-walk is the slow path: hundreds of files × ~1 s of LSP round-trip each. To keep it fast and out of the user's way:
+
+- Each (server, file) cycle is dispatched on `cx.background_executor().spawn` so the work never touches the foreground / UI thread.
+- `futures::stream::iter(files).buffer_unordered(8)` runs 8 files concurrently per server. Cap chosen empirically — sourcekit-lsp handles 8 parallel didOpens cleanly; SQLite's WAL lets concurrent writes go through.
+- Cancellation is automatic via Task drop: when the sweep loop exits (project closed, Zed shut down) the in-flight stream stops polling and pending RPCs are abandoned client-side.
+
+Net cost on a real ~370-swift-file project: ~30 s to cold-index → ~4800 swift symbols cached. Subsequent sweeps every 5 min refresh new/changed files for free.
+
+## Cmd+click cache fallback
+
+`LspStore::definitions(buffer, position)` calls into `cache_definition_fallback` when every running LSP returns an empty result. The fallback:
+
+1. Reads the identifier under the cursor (`word_at_position` — ASCII id-byte boundary scan, no language-specific tokenizer needed).
+2. Queries `ProjectIndexDB::lookup_exact(repo, name)` for every visible worktree.
+3. Sorts hits to prefer files whose extension matches the source buffer's. Cmd+click on `Foo` in `Bar.swift` ranks `.swift` cache rows ahead of `.kt` rows; falls through to cross-language hits when no same-extension match exists, which is the right call for KMP `import Shared`-style nav.
+4. Opens the target buffer via `BufferStore::open_buffer`, builds `Location { buffer, range: Anchor..Anchor }`, returns one `LocationLink` per hit.
+
+The hookup uses a callback registry (`crates/project/src/cache_fallback.rs`) so `project` and `project_index` don't need a circular cargo dependency: `project_index::init` installs the lookup closure at startup, `project::cache_fallback::lookup` calls it. No callback registered (e.g. tests without `project_index`) → empty result, original behavior intact.
+
+## Search Everywhere phase 3
+
+`crates/search_everywhere/src/search_everywhere.rs` queries the cache after its existing LSP `workspace/symbol` phase. Phase ordering:
+
+1. Local match (files + actions + dirs) — published immediately.
+2. LSP `workspace/symbol(query)` — published when ready.
+3. Cache `search_fts(repo, "<query>"*, 200)` — wrapped in a `'phase2` labeled block so phase 2's early-exits don't kill phase 3.
+
+A new `Hit::CachedSymbol` variant carries `CachedSymbol` + name positions. Same priority bucket as live LSP symbols (0) but with a `-1.0` score offset so a live result with the same name always ranks first. `recompute_matches` dedupes on `(name, file, range_start_row)` so the user doesn't see a duplicate row when both live and cached hits land. `render_match` shows `<name> · <rel_path>` with a distinct **CACHE** badge so users see which results came from the cache vs a live language server. Confirm opens the file and centers the cursor on the cached range.
+
+## "Clear Project Index Cache" action
+
+Bound action `zed::ClearProjectIndexCache`. Surfaces in Search Everywhere as `"Clear Project Index Cache"` (matched by typing `clear cache`, `index cache clear`, etc.). Calls `ProjectIndexDB::clear_repo(repo_path)` for every visible worktree. CASCADE drops all `pi_symbols` rows.
+
+## Why SQLite + FTS5 vs Tantivy / redb
+
+Tantivy would be objectively faster for the FTS workload — Lucene-style inverted indexes are purpose-built for this. But Zed already depends on `libsqlite3-sys` and ships migration / domain plumbing via the `db` crate. The marginal speedup wasn't worth a new dep, an extra index format on disk, and a parallel migration story. SQLite FTS5 handles 100k+ symbols with sub-millisecond fuzzy queries; that's already faster than the LSP it's bridging away from.
+
+If the corpus ever outgrows SQLite (millions of symbols across hundreds of repos), porting the FTS layer to Tantivy is straightforward — the `search_fts` API is the only public read surface and could swap implementations.
+
+## What works today
+
+- Search Everywhere fuzzy symbol search with no LSPs running, including `CACHE` badging and dedupe vs live results.
+- Cmd+click go-to-definition with no LSPs running, with same-extension preference + cross-language fallback.
+- Automatic per-project sweep on a 5 min loop while Smart Mode is on; per-file `documentSymbol` for servers that don't honor `workspace/symbol("")`.
+- Detection-based extension / languageId mapping — works for any registered language, no per-server hardcoding.
+- 30-day LRU eviction. CASCADE-aware delete.
+- "Clear Project Index Cache" action via the Smart Mode bottom-bar popover entry point.
+- 8-way parallelism on the disk-walk; all I/O on the background executor; UI never blocks.
+- `.xcframework/` skipped to avoid bundling dependency framework internals.
+
+## Future work — not yet covered
+
+- **Range selection on cache jumps.** Currently the cursor lands at the symbol's start position. Live LSP go-to-def selects the full symbol range. Cache hits should match.
+- **File-watcher-driven re-index.** The collector polls every 5 min. A file save inside that window doesn't refresh its row until the next sweep; users editing a class name won't see the new name in cache for up to 5 minutes. Hooking into `WorktreeStoreEvent::WorktreeUpdatedEntries` to opportunistically re-index modified files would close that gap.
+- **Indexing progress / status surface.** The Smart Mode popover could show "Indexing: N files / N symbols" while the disk-walk is running. Today the only signal is the log file.
+- **Stale rows from uninstalled extensions.** Today they linger until the 30-day TTL. A targeted cleanup keyed on `server_name` would help.
+- **Configurable sweep interval / parallelism / settle delay.** Hardcoded `5 min` / `8` / `800 ms` constants. A `project_index.{refresh_interval_secs,parallel_files_per_server,settle_ms}` settings block would let big-project users tune.
+- **Cache size cap / global eviction.** Per-row TTL only. No upper bound on total DB size if a user has many repos open over weeks. A per-repo or per-DB byte cap with LRU eviction would be cleaner.
+- **Kind-aware UI.** `CachedSymbol.kind` (class/function/method/...) is stored but not surfaced in the popover beyond the generic CACHE badge. Could add an icon or kind chip.
+- **`.swiftinterface` filter at `documentSymbol` level.** Today we drop `.xcframework/` paths in the walk. A symmetric filter on cache READ side would skip stale `.swiftinterface` entries left behind by older sweeps if a user upgrades or removes a framework.
+- **Tantivy migration option.** SQLite FTS5 is fine up to ~10⁶ symbols. Past that, swapping the backend behind the `search_fts` API would unlock another order of magnitude.
+- **Force-rebuild command.** `ClearProjectIndexCache` exists but no "rebuild now" — users have to wait for the next sweep cycle. Adding a `RebuildProjectIndexCache` action that triggers an immediate sweep would be cheap.
+- **Multi-server documentSymbol coverage for the same file.** When two LSPs claim overlapping languages (e.g. ts-language-server + biome both for `.ts`), today only the first responds. Round-robin or merge would give both servers' symbols in the cache.
+- **Container-aware lookup.** The cache stores `container` (parent class name) but `lookup_exact` ignores it. Cmd+click on `foo` could narrow to `foo` whose container is the cursor's enclosing scope.
 
 Implementation:
-- `crates/project_index/src/project_index.rs` — `ProjectIndexDB` domain, schema migrations, `CachedSymbol` + `CachedSymbolKind`, public `replace_file_symbols` / `lookup_exact` / `search_fts` / `count_symbols` / `evict_older_than` / `clear_repo` API. Unit tests cover round-trip, per-server scoping, FTS prefix search, repo scoping.
-- `crates/project_index/src/collector.rs` — per-project background sweep loop. Idle-aware (skips when no LSP running), error-soft.
-- `crates/project_index/src/project_index.rs::init` — startup eviction sweep + per-workspace collector spawn.
+- `crates/project_index/src/project_index.rs` — `ProjectIndexDB` domain, schema migrations, `CachedSymbol` + `CachedSymbolKind`, public `replace_file_symbols` / `lookup_exact` / `search_fts` / `count_symbols` / `evict_older_than` / `clear_repo` API. `init` sets up the eviction sweep + per-workspace collector + cache-fallback closure. `ClearProjectIndexCache` action wired here. Unit tests cover round-trip, per-server scoping, FTS prefix search, repo scoping.
+- `crates/project_index/src/collector.rs` — per-project background sweep loop. Idle-aware. Tracks contributing servers from the `workspace/symbol` sweep, skips them in the disk-walk. `process_one_file` is the per-file worker; `sweep_files_via_lsp` fans them out 8-wide via `buffer_unordered`.
+- `crates/project/src/cache_fallback.rs` — callback-registry shim that lets `LspStore::definitions` call into the project-index cache without a cargo cycle.
+- `crates/project/src/lsp_store.rs` — `cache_definition_fallback` + `word_at_position` + extension-aware ranking; hooked into `definitions()`'s local path after the LSP returns empty.
 - `crates/zed/src/main.rs` — calls `project_index::init(cx)` from the app boot path.
-- `crates/search_everywhere/src/search_everywhere.rs` — phase-3 cache query in `update_matches`, new `Hit::CachedSymbol` variant, dedupe vs live LSP, **CACHE** badge in `render_match`.
+- `crates/search_everywhere/src/search_everywhere.rs` — phase-3 cache query in `update_matches`, new `Hit::CachedSymbol` variant, dedupe vs live LSP, **CACHE** badge in `render_match`, cursor positioning on confirm.
